@@ -1,29 +1,25 @@
 import { NextResponse } from "next/server";
-import { getCurrentUser } from "@/src/lib/auth/current-user";
+import { requireAuth } from "@/src/lib/auth/rbac";
 
 export async function GET() {
   try {
-    const user = await getCurrentUser();
+    const authResult = await requireAuth();
 
-    if (!user || !user.auth) {
-      return NextResponse.json(
-        { success: false, message: "Unauthorized" },
-        { status: 401 }
-      );
+    if (!authResult.success) {
+      return authResult.response;
     }
+
+    const { auth, profile } = authResult.data;
 
     return NextResponse.json({
       success: true,
       user: {
-        id: user.profile?.id ?? null,
-        authUserId: user.auth.id,
-        email: user.auth.email,
-        name:
-          user.profile?.name ??
-          (user.auth.user_metadata?.name as string) ??
-          null,
-        role: user.profile?.role ?? "USER",
-        emailConfirmedAt: user.auth.email_confirmed_at ?? null,
+        id: profile.id,
+        authUserId: auth.id,
+        email: auth.email,
+        name: profile.name ?? (auth.user_metadata?.name as string) ?? null,
+        role: profile.role,
+        emailConfirmedAt: auth.email_confirmed_at ?? null,
       },
     });
   } catch (error: unknown) {
