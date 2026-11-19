@@ -108,6 +108,16 @@ export async function PATCH(request: Request) {
         );
       }
 
+      if (code === "P2002") {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "This mobile number is already in use by another account",
+          },
+          { status: 409 }
+        );
+      }
+
       console.error("Database error during updateProfile:", dbError);
       return NextResponse.json(
         { success: false, message: "Something went wrong" },

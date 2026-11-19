@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { normalizeIndianMobile, isValidIndianMobile } from "./mobile";
 
 export const registerSchema = z.object({
   name: z.string().trim().min(2, "Name must be at least 2 characters").max(80),
@@ -8,6 +9,15 @@ export const registerSchema = z.object({
     .email("Invalid email address")
     .max(254)
     .transform((v) => v.toLowerCase()),
+  mobileNumber: z
+    .string()
+    .trim()
+    .min(1, "Mobile number is required")
+    .refine(isValidIndianMobile, {
+      message:
+        "Please enter a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9",
+    })
+    .transform((val) => normalizeIndianMobile(val)!),
   password: z
     .string()
     .min(8, "Password must be at least 8 characters")

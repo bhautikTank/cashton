@@ -1,6 +1,6 @@
 # CashTon Project Status & Architecture Ledger
 
-Last Updated: 2026-11-18
+Last Updated: 2026-11-19
 
 ---
 
@@ -8,64 +8,89 @@ Last Updated: 2026-11-18
 
 | Phase | Description | Status | Verification Summary |
 |---|---|:---:|---|
-| **Phase 0** | **Environment & Build Foundation** | **COMPLETED** | Next.js 16.4.6, React 19.3.0, Prisma 7.10.1, Supabase Auth (@supabase/ssr), Tailwind CSS v4 via official PostCSS plugin (`postcss.config.mjs`). Build passes cleanly in 198ms. |
+| **Phase 0** | **Environment & Build Foundation** | **COMPLETED** | Next.js 16.4.6, React 19.3.0, Prisma 7.10.1, Supabase Auth (@supabase/ssr), Tailwind CSS v4 via official PostCSS plugin (`postcss.config.mjs`). Build passes cleanly. |
 | **Phase 1** | **RBAC and Authorization** | **COMPLETED** | `requireAuth()`, `requireRole()`, `requireAdmin()`, server-verified `UserRole` enum (`USER`, `ADMIN`, `SUPER_ADMIN`). Verified with `/api/admin/check` (HTTP 403 for `USER`). |
 | **Phase 2** | **User Profile Management** | **COMPLETED** | `GET` and `PATCH /api/users/profile`. Profile sanitization (suppresses `authUserId` and `passwordHash`). Strict single-field mutation (`name`). P2025 and controlled 500 error handling. |
 | **Phase 3** | **Merchant Management** | **COMPLETED** | `Merchant` model and migration applied. Public read APIs, Admin CRUD with soft-deactivation (`isActive = false`), duplicate slug handling (409 Conflict), Zod validation, and full HTTP test suite passed. |
+| **User Info & Wallet** | **Mobile, Payout, Cashback & Wallet Foundation** | **COMPLETED** | Compulsory normalized Indian mobile numbers, AES-256-GCM bank details encryption & masking, `Cashback` lifecycle tracking, `Wallet` & append-only `WalletTransaction` ledger, `GET /api/wallet/summary`, responsive dashboard UI (`/dashboard`, `/wallet`), and automated test suite. |
 | **Phase 4** | **Deals & Coupons Management** | **PLANNED** | Models and endpoints for store deals, coupon codes, expiry dates, and public feeds. |
 | **Phase 5** | **Affiliate Tracking & Redirect Engine** | **PLANNED** | `ClickRecord` tracking, sub-ID generation, dynamic redirects, and click logging. |
-| **Phase 6** | **Cashback Ledger & Postbacks** | **PLANNED** | `CashbackTransaction` financial ledger, affiliate network postback receivers. |
-| **Phase 7** | **Wallet & Payouts** | **PLANNED** | User balances, UPI/Bank payout requests, admin approval workflows. |
+| **Phase 6** | **Cashback Network Postbacks** | **PLANNED** | Affiliate network postback receivers to automatically ingest tracked sales into `Cashback`. |
+| **Phase 7** | **Payout Processing Engine** | **PLANNED** | Admin payout queue approval workflows, batch bank transfers, and withdrawal processing. |
 
 ---
 
-## 2. Phase 3 Details: Merchant Management
+## 2. Phase: User Information, Cashback Summary & Wallet Foundation
 
 ### A. Database Migration
-- **Migration Name:** `20261118165700_create_merchant`
-- **Migration Path:** `prisma/migrations/20261118165700_create_merchant/migration.sql`
+- **Migration Name:** `20261119110000_wallet_cashback_payout`
+- **Migration Path:** `prisma/migrations/20261119110000_wallet_cashback_payout/migration.sql`
 - **Deployment Status:** Successfully applied to Supabase PostgreSQL (`aws-1-ap-northeast-1.pooler.supabase.com:5432`) via `npx prisma migrate deploy`.
 - **Client Status:** Generated to `src/generated/prisma`.
 
-### B. New Database Model
-```prisma
-model Merchant {
-  id          String   @id @default(uuid())
-  name        String
-  slug        String   @unique
-  description String?
-  websiteUrl  String?
-  logoUrl     String?
-  isActive    Boolean  @default(true)
+### B. New Database Models & Extensions
+1. **User Model Extension**: Added `mobileNumber String? @unique` (standardized to E.164 e.g. `+919876543210`).
+2. **PayoutDetails**:
+   - `userId String @unique` (1:1 with User)
+   - `method PayoutMethod` (`BANK`, `UPI`)
+   - `accountHolderName String?`
+   - `bankName String?`
+   - `accountNumberEncrypted String?` (AES-256-GCM encrypted format `iv:authTag:ciphertext`)
+   - `accountNumberLast4 String?` (for masking e.g. `••••••••1234`)
+   - `ifscCode String?` (validated against RBI IFSC regex format)
+   - `upiId String?` (validated against VPA regex format `username@bank`)
+   - `verificationStatus PayoutVerificationStatus` (`PENDING`, `VERIFIED`, `REJECTED`)
+3. **Cashback**:
+   - `userId String` (Relation to User)
+   - `merchantId String?` (Relation to Merchant)
+   - `amount Decimal(10, 2)` (Prisma Decimal, strict precision)
+   - `currency String @default("INR")`
+   - `status CashbackStatus` (`PENDING`, `APPROVED`, `CONFIRMED`, `REJECTED`, `REVERSED`)
+   - `externalReference String?` (Network tracking transaction ID)
+   - `estimatedPaymentDate DateTime?`
+   - `confirmedAt DateTime?`
+4. **Wallet**:
+   - `userId String @unique` (1:1 with User)
+   - `currency String @default("INR")`
+   - `availableBalance Decimal(10, 2) @default(0.00)`
+   - `lifetimeEarned Decimal(10, 2) @default(0.00)`
+   - `lifetimeWithdrawn Decimal(10, 2) @default(0.00)`
+5. **WalletTransaction**:
+   - Append-only financial ledger.
+   - `walletId String` (Relation to Wallet)
+   - `amount Decimal(10, 2)` (Prisma Decimal, strict precision)
+   - `type WalletTransactionType` (`CREDIT`, `DEBIT`, `REVERSAL`, `ADJUSTMENT`)
+   - `category WalletTransactionCategory` (`CASHBACK_CONFIRMED`, `WITHDRAWAL`, `BONUS`, `MANUAL_CORRECTION`, `REFUND`)
+   - `balanceAfter Decimal(10, 2)` (Snapshot of ledger balance post-transaction)
+   - `cashbackId String? @unique` (Unique constraint ensures idempotency - single credit per cashback record)
+   - `idempotencyKey String? @unique` (Protects against duplicate credit/debit operations)
+   - `description String`
 
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+### C. Security & Data Protection
+- **AES-256-GCM Encryption:** Bank account numbers are encrypted in application code using `crypto.createCipheriv` before database insertion. The DB only ever stores `iv:authTag:ciphertext`.
+- **Encryption Key:** Configured via `PAYOUT_ENCRYPTION_KEY` environment variable (32-byte hexadecimal string) with deterministic hash fallback to protect development environments.
+- **Account Masking:** API endpoints (`GET /api/users/payout-details`) and UI components never expose plaintext account numbers. Only masked representations (e.g., `••••••••1234`) are returned.
+- **E.164 Mobile Normalization:** Validates 10-digit Indian numbers (`[6-9]\d{9}`) and automatically formats them as `+91XXXXXXXXXX`.
+- **Financial Precision:** Floating-point numbers are strictly forbidden. All monetary math uses `Prisma.Decimal` and SQL `DECIMAL(10, 2)`.
 
-  @@index([isActive])
-  @@index([createdAt])
-}
-```
-
-### C. Validation & Service Files
-- **Validation Schemas:** `src/lib/validations/merchant.schema.ts`
-  - `createMerchantSchema`: Strict validation for `name`, URL-safe `slug`, optional `description`, `websiteUrl`, `logoUrl`, `isActive`.
-  - `updateMerchantSchema`: Partial update schema with strict field rejection.
-  - `merchantQuerySchema`: Pagination (`page`, `limit` up to 100), `search`.
-- **Service Layer:** `src/modules/merchants/merchant.service.ts`
-  - `getMerchants()`: Paginated active merchants with case-insensitive name search.
-  - `getMerchantByIdOrSlug()`: Public retrieval by UUID or slug (active only).
-  - `createMerchant()`: Admin creation.
-  - `updateMerchant()`: Admin partial update.
-  - `deactivateMerchant()`: Soft deactivation (`isActive = false`).
-
-### D. New API Endpoints
+### D. New & Updated API Endpoints
 | Endpoint | Method | Access Level | Description |
 |---|:---:|:---:|---|
-| `/api/merchants` | `GET` | Public | Paginated directory of active merchants with search. |
-| `/api/merchants/[id]` | `GET` | Public | Get single active merchant by UUID or slug. Returns 404 if missing or inactive. |
-| `/api/admin/merchants` | `POST` | Admin (`ADMIN`, `SUPER_ADMIN`) | Create merchant. Returns 201 on success, 409 on duplicate slug. |
-| `/api/admin/merchants/[id]` | `PATCH` | Admin (`ADMIN`, `SUPER_ADMIN`) | Update merchant. Returns 200 on success, 404 if not found, 409 on slug conflict. |
-| `/api/admin/merchants/[id]` | `DELETE` | Admin (`ADMIN`, `SUPER_ADMIN`) | Soft-deactivate merchant (`isActive = false`). Never hard-deletes. |
+| `/api/auth/register` | `POST` | Public | Requires compulsory `mobileNumber`. Auto-initializes user `Wallet` and handles duplicate mobile conflicts (409 Conflict). |
+| `/api/users/profile` | `GET` / `PATCH` | Authenticated | Exposes and updates `mobileNumber` with E.164 normalization and unique constraint validation. |
+| `/api/users/payout-details` | `GET` | Authenticated | Returns masked payout details for the authenticated user. |
+| `/api/users/payout-details` | `POST` / `PATCH` | Authenticated | Creates or updates bank/UPI payout details with AES-256-GCM encryption and IFSC/UPI validation. |
+| `/api/wallet` | `GET` | Authenticated | Returns user wallet record and paginated append-only transaction history ledger. |
+| `/api/wallet/summary` | `GET` | Authenticated | Computes exact lifecycle totals without double-counting: `trackedCashback`, `availableBalance`, `lifetimeEarned`, `lifetimeWithdrawn`, `pendingCashback`, `approvedCashback`, `confirmedCashback`, `rejectedCashback`. |
+
+### E. User Interface
+- **`/dashboard`**: Full-featured user dashboard presenting:
+  - 6 metric cards: Available Balance, Pending Cashback, Approved Cashback, Lifetime Earned, Total Withdrawn, Rejected Cashback.
+  - Payout details status badge (Verified/Pending/Not configured).
+  - Payout details management form supporting switching between Bank Transfer and UPI.
+  - Recent wallet transaction activity ledger with credit/debit badges and balance snapshots.
+- **`/wallet`**: Responsive user-friendly route navigating to wallet activity and summaries.
+- **`/` (Landing Page)**: Updated with dynamic quick access to user dashboard.
 
 ---
 
@@ -77,15 +102,37 @@ model Merchant {
 | **Prisma Client Generation** | `npx prisma generate --config prisma7.config.ts` | **PASS** (Exit 0) |
 | **TypeScript Typecheck** | `npx tsc --noEmit` | **PASS** (0 errors) |
 | **ESLint Static Analysis** | `npm run lint` | **PASS** (0 errors, 0 warnings) |
-| **Next.js Production Build** | `npm run build` | **PASS** (13/13 routes compiled & prerendered in 198ms) |
-| **Integration Test Suite** | HTTP test suite across all 21 test scenarios | **PASS** (21/21 passed) |
+| **Next.js Production Build** | `npm run build` | **PASS** (18/18 routes compiled & prerendered) |
+| **Automated End-to-End Test Suite** | `node scripts/test-runner.mjs` | **PASS** (14/14 integration tests passed) |
+
+### Test Suite Execution Output (`scripts/test-runner.mjs`)
+- `[PASS]` Mobile number validation and E.164 normalization (`+919876543210`)
+- `[PASS]` Bank account & UPI encryption (AES-256-GCM) and masking (`••••••••9012`, `te••••er@okhdfcbank`)
+- `[PASS]` Strict key enforcement: PAYOUT_ENCRYPTION_KEY mandatory in production
+- `[PASS]` Registration with required mobile number -> 201 Created
+- `[PASS]` Duplicate mobile number registration rejection -> 409 Conflict
+- `[PASS]` Login test user -> 200 OK
+- `[PASS]` Profile GET & PATCH supports mobile number
+- `[PASS]` Payout details storage: Encrypted in DB & Masked in API (`••••••••••1234`)
+- `[PASS]` Payout details UPI method update -> 200 OK
+- `[PASS]` Unauthenticated requests to wallet & payout APIs -> 401 Unauthorized
+- `[PASS]` Wallet summary with zero records returns ₹0.00
+- `[PASS]` Wallet calculations: Precision Decimal totals & Ledger balance (Tracked: ₹850.75, Available: ₹400.00, Paid Out: ₹100.00)
+- `[PASS]` Ledger idempotency: Duplicate cashback credit rejected by unique constraint
+- `[PASS]` Financial integrity: Negative wallet balance prevented atomically
 
 ---
 
-## 4. Known Limitations & Future Considerations
-1. **Unaccented Search:** Current merchant name search uses PostgreSQL `mode: "insensitive"`. When scaling to thousands of merchants, PostgreSQL `pg_trgm` or full-text search indexes (`tsvector`) should be introduced.
-2. **Logo Asset Uploads:** Current implementation takes direct `logoUrl` strings. Direct S3/Supabase Storage bucket upload integration will be added in future assets sprint.
-3. **Soft Deactivation Cascade:** Soft deactivating a merchant currently sets `isActive = false`. When `Deal` records are implemented in Phase 4, deactivating a merchant should automatically suppress its associated active deals from public feeds.
+## 4. Environment Variables Required
+
+| Variable | Required In | Description |
+|---|---|---|
+| `DATABASE_URL` | All Environments | PostgreSQL connection string with pgbouncer/pooling. |
+| `DIRECT_URL` | All Environments | Direct PostgreSQL connection string for Prisma migrations. |
+| `NEXT_PUBLIC_SUPABASE_URL` | All Environments | Supabase project URL. |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | All Environments | Supabase anonymous public key. |
+| `PAYOUT_ENCRYPTION_KEY` | Production / Staging | 64-character hex string (32 bytes) strictly mandatory in production and staging for AES-256-GCM payout data encryption. Fails fast if missing. |
+| `SMTP_*` / `RESEND_API_KEY` | Optional | For email notifications. Currently abstracted via `email.service.ts` log mock. |
 
 ---
 
