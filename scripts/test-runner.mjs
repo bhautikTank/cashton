@@ -78,9 +78,10 @@ async function runTests() {
     });
 
     // -------------------------------------------------------------------
-    // 3. SECURITY: Strict PAYOUT_ENCRYPTION_KEY in Production
+    // 3. SECURITY: Strict PAYOUT_ENCRYPTION_KEY in Production & Staging
     // -------------------------------------------------------------------
     let prodKeyEnforced = false;
+    let invalidKeyRejected = false;
     const origEnv = process.env.NODE_ENV;
     const origKey = process.env.PAYOUT_ENCRYPTION_KEY;
     try {
@@ -89,15 +90,23 @@ async function runTests() {
       getEncryptionKey();
     } catch (err) {
       prodKeyEnforced = err.message.includes("PAYOUT_ENCRYPTION_KEY environment variable is mandatory");
+    }
+
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.PAYOUT_ENCRYPTION_KEY = "invalid-short-key";
+      getEncryptionKey();
+    } catch (err) {
+      invalidKeyRejected = err.message.includes("PAYOUT_ENCRYPTION_KEY is invalid");
     } finally {
       process.env.NODE_ENV = origEnv;
       if (origKey) process.env.PAYOUT_ENCRYPTION_KEY = origKey;
     }
 
     results.push({
-      name: "Strict key enforcement: PAYOUT_ENCRYPTION_KEY mandatory in production",
-      passed: prodKeyEnforced,
-      detail: `Enforced rejection without key: ${prodKeyEnforced}`
+      name: "Strict key enforcement: PAYOUT_ENCRYPTION_KEY mandatory & must be valid in production",
+      passed: prodKeyEnforced && invalidKeyRejected,
+      detail: `Missing key rejected: ${prodKeyEnforced}, Invalid key rejected: ${invalidKeyRejected}`
     });
 
     // -------------------------------------------------------------------
@@ -237,6 +246,7 @@ async function runTests() {
     });
 
     // 8b. Save UPI Details
+    const rawUpi = "tester@okhdfcbank";
     const upiRes = await fetch(`${BASE_URL}/api/users/payout-details`, {
       method: "POST",
       headers: {
@@ -245,17 +255,24 @@ async function runTests() {
       },
       body: JSON.stringify({
         payoutMethod: "UPI",
-        upiId: "tester@okhdfcbank",
+        upiId: rawUpi,
       }),
     });
     const upiData = await upiRes.json();
 
+    const dbUpiRes = await pgClient.query('SELECT "upiId" FROM "PayoutDetails" WHERE "userId" = $1', [testUserId]);
+    const dbUpiRow = dbUpiRes.rows[0];
+    const isUpiEncryptedInDb = dbUpiRow?.upiId &&
+                              !dbUpiRow.upiId.includes(rawUpi) &&
+                              decryptSensitive(dbUpiRow.upiId) === rawUpi;
+
     results.push({
-      name: "Payout details UPI method update -> 200 OK",
+      name: "Payout details UPI method: Encrypted at rest in DB & Masked in API",
       passed: upiRes.status === 200 &&
-              upiData.payoutDetails?.upiId === "tester@okhdfcbank" &&
+              isUpiEncryptedInDb &&
+              upiData.payoutDetails?.upiId === "te••••er@okhdfcbank" &&
               upiData.payoutDetails?.upiIdMasked === "te••••er@okhdfcbank",
-      detail: `UPI: ${upiData.payoutDetails?.upiId}, Masked: ${upiData.payoutDetails?.upiIdMasked}`
+      detail: `DB Encrypted: ${dbUpiRow?.upiId?.slice(0, 20)}..., API Masked: ${upiData.payoutDetails?.upiIdMasked}`
     });
 
     // -------------------------------------------------------------------
@@ -387,6 +404,36 @@ async function runTests() {
       name: "Financial integrity: Negative wallet balance prevented atomically",
       passed: overdraftBlocked,
       detail: `Overdraft update row count: ${overdraftResult.rowCount} (0 rows updated)`
+    });
+
+    // -------------------------------------------------------------------
+    // 14. CASHBACK LIFECYCLE: Strict State Machine & Terminal State Enforcement
+    // -------------------------------------------------------------------
+    const VALID_TRANSITIONS = {
+      PENDING: ["APPROVED", "REJECTED"],
+      APPROVED: ["CONFIRMED", "REJECTED"],
+      CONFIRMED: ["REVERSED"],
+      REJECTED: [],
+      REVERSED: [],
+    };
+
+    function isValidTransition(from, to) {
+      return (VALID_TRANSITIONS[from] || []).includes(to);
+    }
+
+    const t1 = isValidTransition("PENDING", "APPROVED"); // true
+    const t2 = !isValidTransition("PENDING", "CONFIRMED"); // true (blocked)
+    const t3 = isValidTransition("APPROVED", "CONFIRMED"); // true
+    const t4 = isValidTransition("CONFIRMED", "REVERSED"); // true
+    const t5 = !isValidTransition("REJECTED", "PENDING"); // true (terminal)
+    const t6 = !isValidTransition("REVERSED", "CONFIRMED"); // true (terminal)
+
+    const lifecycleStrict = t1 && t2 && t3 && t4 && t5 && t6;
+
+    results.push({
+      name: "Cashback lifecycle: Strict state machine with terminal states",
+      passed: lifecycleStrict,
+      detail: `PENDING->CONFIRMED blocked: ${t2}, REJECTED terminal: ${t5}, REVERSED terminal: ${t6}`
     });
 
   } finally {

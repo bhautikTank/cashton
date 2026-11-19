@@ -11,10 +11,10 @@ export interface CreateCashbackInput {
 }
 
 const VALID_TRANSITIONS: Record<CashbackStatus, CashbackStatus[]> = {
-  PENDING: ["APPROVED", "CONFIRMED", "REJECTED"],
+  PENDING: ["APPROVED", "REJECTED"],
   APPROVED: ["CONFIRMED", "REJECTED"],
   CONFIRMED: ["REVERSED"],
-  REJECTED: ["PENDING"],
+  REJECTED: [],
   REVERSED: [],
 };
 

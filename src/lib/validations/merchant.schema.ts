@@ -2,6 +2,17 @@ import { z } from "zod";
 
 const slugRegex = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
+const httpUrl = (fieldName: string) =>
+  z
+    .string()
+    .trim()
+    .url(`${fieldName} must be a valid HTTP or HTTPS URL`)
+    .refine(
+      (url) => url.startsWith("https://") || url.startsWith("http://"),
+      `${fieldName} must start with http:// or https://`
+    )
+    .max(500, `${fieldName} must not exceed 500 characters`);
+
 export const createMerchantSchema = z
   .object({
     name: z
@@ -26,19 +37,11 @@ export const createMerchantSchema = z
       .optional()
       .nullable()
       .transform((val) => (val === "" ? null : val)),
-    websiteUrl: z
-      .string()
-      .trim()
-      .url("Website URL must be a valid HTTP or HTTPS URL")
-      .max(500, "Website URL must not exceed 500 characters")
+    websiteUrl: httpUrl("Website URL")
       .optional()
       .nullable()
       .or(z.literal("").transform(() => null)),
-    logoUrl: z
-      .string()
-      .trim()
-      .url("Logo URL must be a valid HTTP or HTTPS URL")
-      .max(500, "Logo URL must not exceed 500 characters")
+    logoUrl: httpUrl("Logo URL")
       .optional()
       .nullable()
       .or(z.literal("").transform(() => null)),
@@ -72,19 +75,11 @@ export const updateMerchantSchema = z
       .optional()
       .nullable()
       .transform((val) => (val === "" ? null : val)),
-    websiteUrl: z
-      .string()
-      .trim()
-      .url("Website URL must be a valid HTTP or HTTPS URL")
-      .max(500, "Website URL must not exceed 500 characters")
+    websiteUrl: httpUrl("Website URL")
       .optional()
       .nullable()
       .or(z.literal("").transform(() => null)),
-    logoUrl: z
-      .string()
-      .trim()
-      .url("Logo URL must be a valid HTTP or HTTPS URL")
-      .max(500, "Logo URL must not exceed 500 characters")
+    logoUrl: httpUrl("Logo URL")
       .optional()
       .nullable()
       .or(z.literal("").transform(() => null)),

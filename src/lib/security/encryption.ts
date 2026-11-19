@@ -5,12 +5,13 @@ const IV_LENGTH = 16;
 
 /**
  * Derives a consistent 32-byte key for AES-256-GCM.
- * PAYOUT_ENCRYPTION_KEY is strictly mandatory in production and staging environments.
- * Outside production/staging (local development only), a fallback key is derived.
+ * PAYOUT_ENCRYPTION_KEY is strictly mandatory and must be a valid 64-char hex string (32 bytes)
+ * in every deployed environment (production, staging, preview).
+ * Outside deployed environments (local development only), a fallback key may be derived.
  */
 export function getEncryptionKey(): Buffer {
   const secret = process.env.PAYOUT_ENCRYPTION_KEY;
-  const isProductionOrStaging =
+  const isDeployedEnv =
     process.env.NODE_ENV === "production" ||
     process.env.APP_ENV === "staging" ||
     process.env.APP_ENV === "production" ||
@@ -18,12 +19,12 @@ export function getEncryptionKey(): Buffer {
     process.env.VERCEL_ENV === "preview";
 
   if (!secret) {
-    if (isProductionOrStaging) {
+    if (isDeployedEnv) {
       throw new Error(
-        "PAYOUT_ENCRYPTION_KEY environment variable is mandatory in production and staging environments."
+        "PAYOUT_ENCRYPTION_KEY environment variable is mandatory in deployed environments."
       );
     }
-    const fallback = process.env.DATABASE_URL || "cashton-default-payout-secret-key-32";
+    const fallback = process.env.DATABASE_URL || "cashton-dev-local-secret-key-32";
     return crypto.createHash("sha256").update(fallback).digest();
   }
 
@@ -32,11 +33,22 @@ export function getEncryptionKey(): Buffer {
     return Buffer.from(secret, "hex");
   }
 
+  // If 32-byte string
+  if (Buffer.byteLength(secret, "utf8") === 32) {
+    return Buffer.from(secret, "utf8");
+  }
+
+  if (isDeployedEnv) {
+    throw new Error(
+      "PAYOUT_ENCRYPTION_KEY is invalid. It must be a 64-character hex string (32 bytes) or a 32-character key in deployed environments."
+    );
+  }
+
   return crypto.createHash("sha256").update(secret).digest();
 }
 
 /**
- * Encrypts sensitive text (e.g. bank account number) using AES-256-GCM.
+ * Encrypts sensitive text (e.g. bank account number or UPI ID) using AES-256-GCM.
  * Format: `${iv}:${authTag}:${encrypted}` (hex encoded)
  */
 export function encryptSensitive(plaintext: string): string {
@@ -101,7 +113,7 @@ export function maskUpiId(upiId: string | null | undefined): string | null {
   if (parts.length !== 2) return clean;
   const [handle, provider] = parts;
   if (handle.length <= 4) {
-    return `${handle[0]}•••@${provider}`;
+    return `${handle[0]}••••@${provider}`;
   }
   const prefix = handle.slice(0, 2);
   const suffix = handle.slice(-2);

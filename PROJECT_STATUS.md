@@ -104,6 +104,7 @@ Last Updated: 2026-11-19
 | **ESLint Static Analysis** | `npm run lint` | **PASS** (0 errors, 0 warnings) |
 | **Next.js Production Build** | `npm run build` | **PASS** (18/18 routes compiled & prerendered) |
 | **Automated End-to-End Test Suite** | `node scripts/test-runner.mjs` | **PASS** (14/14 integration tests passed) |
+| **Chaos & Penetration Test Suite** | `node scripts/chaos-security-tester.mjs` | **PASS** (53/53 adversarial attack scenarios passed, 100% resilience) |
 
 ### Test Suite Execution Output (`scripts/test-runner.mjs`)
 - `[PASS]` Mobile number validation and E.164 normalization (`+919876543210`)
@@ -120,6 +121,15 @@ Last Updated: 2026-11-19
 - `[PASS]` Wallet calculations: Precision Decimal totals & Ledger balance (Tracked: ₹850.75, Available: ₹400.00, Paid Out: ₹100.00)
 - `[PASS]` Ledger idempotency: Duplicate cashback credit rejected by unique constraint
 - `[PASS]` Financial integrity: Negative wallet balance prevented atomically
+
+### Adversarial & Chaos Testing Summary (`scripts/chaos-security-tester.mjs`)
+- **Category 1 (Authentication Attacks)**: Empty payloads, missing fields, foreign numbers, malformed emails, weak passwords, SQL injection, prototype pollution, duplicate registrations, and invalid credential brute-forcing all properly rejected.
+- **Category 2 (RBAC & Privilege Escalation)**: Unauthenticated and standard user access to `/api/admin/check` blocked (401/403). Client header spoofing (`X-User-Role: ADMIN`, `Authorization: fake`) completely ignored.
+- **Category 3 (Profile & Mass Assignment)**: Attempts to mutate `role`, `isAdmin`, `id`, or `authUserId` rejected with 400 Bad Request via strict Zod schemas.
+- **Category 4 (Merchant Security)**: Pagination limits strictly enforced ($\le 100$). Malicious `javascript:` URI schemes rejected. Inactive merchants strictly suppressed from public read routes. Soft-deactivation verified to never delete PostgreSQL rows.
+- **Category 5 (Payout Details Attacks)**: Payout verification status tampering (`status: VERIFIED`) rejected. Format validation for IFSC and UPI VPAs strictly enforced. AES-256-GCM database ciphertext and API masking verified.
+- **Category 6 (Financial Ledger Concurrency & Chaos)**: Decimal math verified immune to floating-point rounding errors ($10 \times 0.10 = 1.00$). Simultaneous parallel overdraft debits under high concurrency prevented atomically ($1$ won, $4$ blocked, balance preserved at ₹0.00). Double-credit race conditions blocked by database unique constraint.
+- **Category 7 (Protocol & Malformed Payloads)**: Truncated JSON, array/primitive JSON roots, and 100KB string floods handled gracefully without crashing or leaking diagnostics. Database health endpoint verified.
 
 ---
 
