@@ -37,6 +37,11 @@ enum CashbackStatus {
   REVERSED
 }
 
+enum DiscountType {
+  PERCENTAGE
+  FIXED
+}
+
 enum WalletTransactionType {
   CREDIT
   DEBIT
@@ -81,6 +86,8 @@ model Merchant {
   updatedAt   DateTime @updatedAt
 
   cashbacks   Cashback[]
+  deals       Deal[]
+  coupons     Coupon[]
 
   @@index([isActive])
   @@index([createdAt])
@@ -159,5 +166,56 @@ model WalletTransaction {
   createdAt      DateTime                  @default(now())
 
   @@index([walletId])
+  @@index([createdAt])
+}
+
+model Deal {
+  id            String    @id @default(uuid())
+  merchantId    String
+  merchant      Merchant  @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  title         String
+  slug          String    @unique
+  description   String?
+  imageUrl      String?
+  originalPrice Decimal?  @db.Decimal(10, 2)
+  dealPrice     Decimal?  @db.Decimal(10, 2)
+  affiliateUrl  String?
+  startDate     DateTime?
+  endDate       DateTime?
+  isActive      Boolean   @default(true)
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([merchantId])
+  @@index([isActive])
+  @@index([startDate, endDate])
+  @@index([createdAt])
+}
+
+model Coupon {
+  id              String       @id @default(uuid())
+  merchantId      String
+  merchant        Merchant     @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  title           String
+  code            String
+  description     String?
+  discountType    DiscountType
+  discountValue   Decimal      @db.Decimal(10, 2)
+  minimumPurchase Decimal?     @db.Decimal(10, 2)
+  maximumDiscount Decimal?     @db.Decimal(10, 2)
+  usageLimit      Int?
+  startDate       DateTime?
+  endDate         DateTime?
+  isActive        Boolean      @default(true)
+
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@unique([merchantId, code])
+  @@index([code])
+  @@index([merchantId])
+  @@index([isActive])
+  @@index([startDate, endDate])
   @@index([createdAt])
 }
