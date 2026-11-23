@@ -60,6 +60,21 @@ enum WalletTransactionCategory {
   PAYOUT
   ADMIN_ADJUSTMENT
   BONUS
+  CASHBACK_HELD
+  HOLD_RELEASED
+  REVERSAL_FROM_HELD
+  REVERSAL_FROM_AVAILABLE
+  DEBT_CREATED
+  DEBT_RECOVERED
+  DEBT_WRITTEN_OFF
+}
+
+enum CashbackDebtStatus {
+  OPEN
+  UNDER_REVIEW
+  DISPUTED
+  RECOVERED
+  WRITTEN_OFF
 }
 
 enum AffiliateProvider {
@@ -102,6 +117,7 @@ model User {
   wallet          Wallet?
   affiliateClicks AffiliateClick[]
   conversions     Conversion[]
+  debts           CashbackDebt[]
 }
 
 model Merchant {
@@ -160,28 +176,39 @@ model Cashback {
   approvedAt          DateTime?
   confirmedAt         DateTime?
 
+  heldAmount          Decimal            @default(0.00) @db.Decimal(10, 2)
+  heldUntil           DateTime?
+  holdReleased        Boolean            @default(false)
+  reversedAmount      Decimal            @default(0.00) @db.Decimal(10, 2)
+
   createdAt           DateTime           @default(now())
   updatedAt           DateTime           @updatedAt
 
-  walletTransaction   WalletTransaction?
+  walletTransactions  WalletTransaction[]
   conversion          Conversion?
+  debts               CashbackDebt[]
 
   @@index([userId])
   @@index([status])
   @@index([merchantId])
   @@index([createdAt])
+  @@index([heldUntil, holdReleased])
 }
 
 model Wallet {
-  id           String              @id @default(uuid())
-  userId       String              @unique
-  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
-  balance      Decimal             @default(0.00) @db.Decimal(10, 2)
+  id               String              @id @default(uuid())
+  userId           String              @unique
+  user             User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance          Decimal             @default(0.00) @db.Decimal(10, 2)
+  availableBalance Decimal             @default(0.00) @db.Decimal(10, 2)
+  heldBalance      Decimal             @default(0.00) @db.Decimal(10, 2)
+  debtBalance      Decimal             @default(0.00) @db.Decimal(10, 2)
 
-  createdAt    DateTime            @default(now())
-  updatedAt    DateTime            @updatedAt
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
 
-  transactions WalletTransaction[]
+  transactions     WalletTransaction[]
+  debts            CashbackDebt[]
 
   @@index([userId])
 }
@@ -195,13 +222,17 @@ model WalletTransaction {
   category       WalletTransactionCategory
   idempotencyKey String?                   @unique
   description    String
-  cashbackId     String?                   @unique
+  cashbackId     String?
   cashback       Cashback?                 @relation(fields: [cashbackId], references: [id], onDelete: SetNull)
+  debtId         String?
+  debt           CashbackDebt?             @relation(fields: [debtId], references: [id], onDelete: SetNull)
 
   createdAt      DateTime                  @default(now())
 
   @@index([walletId])
   @@index([createdAt])
+  @@index([cashbackId])
+  @@index([debtId])
 }
 
 model Deal {
@@ -306,15 +337,19 @@ model Conversion {
   orderAmount           Decimal           @db.Decimal(10, 2)
   commissionAmount      Decimal           @db.Decimal(10, 2)
   cashbackAmount        Decimal           @default(0.00) @db.Decimal(10, 2)
+  reversedAmount        Decimal           @default(0.00) @db.Decimal(10, 2)
   currency              String            @default("INR")
   status                ConversionStatus  @default(PENDING)
 
   convertedAt           DateTime          @default(now())
   rawPayload            Json?
+  campaignSnapshot      Json?
   reconciliationNotes   String?
 
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
+
+  debts                 CashbackDebt[]
 
   @@unique([provider, externalTransactionId])
   @@index([provider, externalTransactionId])
@@ -330,6 +365,7 @@ model Conversion {
 model Campaign {
   id                  String             @id @default(uuid())
   name                String
+  description         String?
   merchantId          String?
   merchant            Merchant?          @relation(fields: [merchantId], references: [id], onDelete: SetNull)
   dealId              String?
@@ -358,4 +394,32 @@ model Campaign {
   @@index([isActive])
   @@index([priority])
   @@index([createdAt])
+}
+
+model CashbackDebt {
+  id                      String             @id @default(uuid())
+  walletId                String
+  wallet                  Wallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  userId                  String
+  user                    User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount                  Decimal            @db.Decimal(10, 2)
+  remainingAmount         Decimal            @db.Decimal(10, 2)
+  status                  CashbackDebtStatus @default(OPEN)
+  originatingCashbackId   String?
+  originatingCashback     Cashback?          @relation(fields: [originatingCashbackId], references: [id], onDelete: SetNull)
+  originatingConversionId String?
+  originatingConversion   Conversion?        @relation(fields: [originatingConversionId], references: [id], onDelete: SetNull)
+  reason                  String?
+  resolvedByAdminId       String?
+  resolvedAt              DateTime?
+  notes                   String?
+
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+
+  transactions            WalletTransaction[]
+
+  @@index([walletId, status])
+  @@index([userId])
+  @@index([status])
 }

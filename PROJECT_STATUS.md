@@ -15,8 +15,9 @@ Last Updated: 2026-11-19
 | **User Info & Wallet** | **Mobile, Payout, Cashback & Wallet Foundation** | **COMPLETED** | Compulsory normalized Indian mobile numbers, AES-256-GCM bank details encryption & masking, `Cashback` lifecycle tracking, `Wallet` & append-only `WalletTransaction` ledger, `GET /api/wallet/summary`, responsive dashboard UI (`/dashboard`, `/wallet`), and automated test suite. |
 | **Phase 4** | **Deals & Coupons Management** | **COMPLETED** | `Deal` and `Coupon` models with migration deployed, Decimal financial precision, strict Zod validation (`dealPrice <= originalPrice`, `discountValue`, date ranges, usage limits, strict mass-assignment protection), Admin CRUD with soft-deactivation (`isActive = false`), Public listing & slug/id lookup with date validity & inactive merchant cascading suppression, and 36/36 end-to-end integration tests passed. |
 | **Phase 5** | **Affiliate Tracking & Redirect Engine** | **COMPLETED** | `AffiliateClick` model and migration deployed (`20261120170000_create_affiliate_click`). CSPRNG opaque tracking IDs (`clk_...`), server-side destination resolution, open-redirect defense, rate limiting, duplicate redirect handling, and Admin analytics & summary endpoints. 33/33 integration tests passed. |
-| **Phase 6** | **Affiliate Network Integration & Conversion Tracking** | **COMPLETED** | Multi-network postbacks (`FLIPKART`, `CUELINKS`, `ADMITAD`, `EARNKARO`, `GENERIC`), click attribution, `Conversion` model & migration deployed (`20261123120000_create_conversions`), idempotent deduplication (`@@unique([provider, externalTransactionId])`), lifecycle state machine, atomic wallet crediting on `CONFIRMED`, atomic reversals on `REVERSED`, UNMATCHED conversion manual reconciliation, and 39/39 tests passed. |
-| **Phase 7** | **Payout Processing Engine** | **PLANNED** | Admin payout queue approval workflows, batch bank transfers, and withdrawal processing. |
+| **Phase 6** | **Affiliate Network Integration & Conversion Tracking** | **COMPLETED** | Multi-network postbacks (`FLIPKART`, `CUELINKS`, `ADMITAD`, `EARNKARO`, `GENERIC`), click attribution, `Conversion` model & migration deployed (`20261123120000_create_conversions`), idempotent deduplication (`@@unique([provider, externalTransactionId])`), lifecycle state machine, atomic wallet crediting on `CONFIRMED`, atomic reversals on `REVERSED`, UNMATCHED conversion manual reconciliation, and 41/41 tests passed. |
+| **Phase 7** | **Campaign Engine & Cashback Lifecycle Completion** | **COMPLETED** | Admin Campaign CRUD, deterministic 4-level campaign selection hierarchy (Deal -> Merchant -> Network -> Global), Decimal precision & ROUND_HALF_UP rounding, immutable snapshots in Conversion records, end-to-end cashback lifecycle integration (PENDING -> APPROVED -> CONFIRMED [atomic wallet credit] -> REVERSED [atomic balance reversal]), soft-deactivation protection. 31/31 automated tests passed. |
+| **Phase 8** | **Payout Processing Engine** | **PLANNED** | Admin payout queue approval workflows, batch bank transfers, and withdrawal processing. |
 
 ---
 
@@ -349,35 +350,93 @@ Last Updated: 2026-11-19
 
 ---
 
-## 7. Comprehensive Test Results Matrix
+## 7. Phase 7: Campaign Engine & Cashback Lifecycle Completion
+
+### A. Database Migration
+- **Migration Name:** `20261123170000_campaign_engine_and_snapshots`
+- **Migration Path:** `prisma/migrations/20261123170000_campaign_engine_and_snapshots/migration.sql`
+- **Deployment Status:** Successfully applied to Supabase PostgreSQL (`aws-1-ap-northeast-1.pooler.supabase.com:5432`) via `npx prisma migrate deploy`.
+- **Prisma Client Status:** Generated via `npx prisma generate --config prisma7.config.ts`.
+- **Migration Count:** 10 applied migrations, 0 schema drift, schema up to date.
+
+### B. Database Schema Enhancements
+1. **Campaign Model Enhancement**:
+   - Added `description String?` to `model Campaign` to allow administrative campaign documentation and notes.
+   - Leveraged existing `model Campaign` schema containing `merchantId`, `dealId`, `network` (`AffiliateProvider`), `cashbackRate`, `cashbackType` (`PERCENTAGE`, `FIXED`), `minOrderAmount`, `maxCashbackPerOrder`, `maxCashbackPerUser`, `maxCampaignBudget`, `totalCashbackPaid`, `priority`, `startDate`, `endDate`, and `isActive`.
+2. **Conversion Model Enhancement**:
+   - Added `campaignSnapshot Json?` to `model Conversion` storing an immutable audit record of the campaign configuration at the exact moment conversion was ingested.
+   - Retained relational fields `campaignId String?`, `shareType CashbackShareType?`, `userShareValue Decimal(10, 2)?`.
+
+### C. Campaign Engine Architecture & Rules
+- **Deterministic 4-Level Selection Hierarchy**:
+  - **Level 4 (Most Specific):** Deal-Specific (`dealId === params.dealId`).
+  - **Level 3:** Merchant-Specific (`merchantId === params.merchantId && !dealId`).
+  - **Level 2:** Network-Specific (`network === params.network && !merchantId && !dealId`).
+  - **Level 1 (Fallback):** Global Platform Default (`!merchantId && !dealId && !network`).
+  - **Deterministic Tie-Breaking:** `priority DESC`, `createdAt DESC`, `id ASC`.
+- **Eligibility Constraints**:
+  - `isActive === true`.
+  - Date bounds: `(startDate === null || startDate <= now) && (endDate === null || endDate >= now)`.
+  - Minimum order: `orderAmount >= minOrderAmount` (if configured).
+  - Campaign budget cap: `(totalCashbackPaid + cashbackAmount) <= maxCampaignBudget` (if configured).
+  - Per-user cap: `(userLifetimeCashbackInCampaign + cashbackAmount) <= maxCashbackPerUser` (if configured).
+- **Financial Precision & Rounding Policy**:
+  - Zero floating-point operations. All financial math is computed via `Prisma.Decimal`.
+  - Rounding Mode: `ROUND_HALF_UP` strictly rounded to 2 decimal places (`toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)`).
+  - Formula (PERCENTAGE): `cashbackAmount = min(round_half_up(orderAmount * (cashbackRate / 100)), maxCashbackPerOrder)`.
+  - Formula (FIXED): `cashbackAmount = min(cashbackRate, maxCashbackPerOrder)`.
+- **Immutable Campaign Snapshot**:
+  - Serialized at conversion ingestion: `{ campaignId, campaignName, cashbackType, cashbackRate, priority, level, minOrderAmount, maxCashbackPerOrder, calculatedCashback, orderAmount, calculatedAt }`.
+  - Subsequent admin changes to campaigns (rates, caps, status) cannot alter historical conversion economics or ledger totals.
+- **Conversion Lifecycle Integration**:
+  - Ingestion calculates cashback from matched campaign rule and creates `Cashback` in `PENDING` status.
+  - Updates to `APPROVED` synchronize `Cashback` to `APPROVED`.
+  - Network `CONFIRMED` atomically transitions `Cashback` to `CONFIRMED`, credits the user's `Wallet` ledger with `CREDIT` transaction, and increments `Campaign.totalCashbackPaid`.
+  - Duplicate `CONFIRMED` postbacks are strictly idempotent no-ops (protected by `WalletTransaction.cashbackId @unique`).
+  - Network `REVERSED` postbacks atomically decrement user wallet balance, create a `REVERSAL` ledger record, and decrement `Campaign.totalCashbackPaid`.
+- **Soft-Deactivation Protection**:
+  - Admin `DELETE /api/admin/campaigns/[id]` checks for linked conversions. If conversions exist, campaign is soft-deactivated (`isActive = false`) to preserve foreign key integrity. If no conversions exist, row is deleted.
+
+### D. Implemented API Endpoints
+| Endpoint | Method | Access Level | Description |
+|---|:---:|:---:|---|
+| `/api/admin/campaigns` | `GET` | Admin | Paginated list of campaigns with status, merchant, network, and search filters. |
+| `/api/admin/campaigns` | `POST` | Admin | Creates a campaign with strict Zod validation (rate bounds, date validation, priority). |
+| `/api/admin/campaigns/[id]` | `GET` | Admin | Retrieves complete campaign details including relations and total paid cashback. |
+| `/api/admin/campaigns/[id]` | `PATCH` | Admin | Updates campaign parameters with validation. |
+| `/api/admin/campaigns/[id]` | `DELETE` | Admin | Soft-deactivates campaign (`isActive = false`) if conversions exist, or hard-deletes if unused. |
+
+---
+
+## 8. Comprehensive Test Results Matrix
 
 | Quality / Test Suite | Command | Result | Pass Rate |
 |---|---|:---:|:---:|
 | **Prisma Schema Validation** | `npx prisma validate --config prisma7.config.ts` | **PASS** (Exit 0) | 100% |
 | **Prisma Client Generation** | `npx prisma generate --config prisma7.config.ts` | **PASS** (Exit 0) | 100% |
-| **Prisma Migration Status** | `npx prisma migrate status --config prisma7.config.ts` | **PASS** (7 applied, 0 drift) | 100% |
+| **Prisma Migration Status** | `npx prisma migrate status --config prisma7.config.ts` | **PASS** (10 applied, 0 drift) | 100% |
 | **TypeScript Typecheck** | `npx tsc --noEmit` | **PASS** (0 errors) | 100% |
 | **ESLint Static Analysis** | `npm run lint` | **PASS** (0 errors, 0 warnings) | 100% |
 | **Next.js Production Build** | `npx next build --webpack` | **PASS** (31/31 routes compiled) | 100% |
-| **Phase 6 Network & Conversion Suite** | `node scripts/test-phase6.mjs` | **PASS** (39/39 scenarios passed) | **100%** |
+| **Phase 7 Campaign & Lifecycle Suite** | `node scripts/test-phase7.mjs` | **PASS** (31/31 scenarios passed) | **100%** |
+| **Phase 6 Network & Conversion Suite** | `node scripts/test-phase6.mjs` | **PASS** (41/41 scenarios passed) | **100%** |
 | **Phase 5 Click & Redirect Suite** | `node scripts/test-phase5.mjs` | **PASS** (33/33 scenarios passed) | **100%** |
 | **Phase 4 Deals & Coupons Suite** | `node scripts/test-phase4.mjs` | **PASS** (36/36 scenarios passed) | **100%** |
-| **Wallet & Cashback Lifecycle Suite** | `node scripts/test-runner.mjs` | **PASS** (15/15 scenarios passed) | **100%** |
-| **Adversarial & Chaos Security Suite** | `node scripts/chaos-security-tester.mjs` | **PASS** (55/55 scenarios passed) | **100%** |
-| **Combined Regression Matrix** | **Full System Verification** | **PASS** (**178 / 178 tests passed**) | **100%** |
+| **Security & Concurrency Audit Suite** | `node scripts/comprehensive-security-audit.mjs` | **PASS** (52/52 scenarios passed) | **100%** |
+| **Combined Regression Matrix** | **Full System Verification** | **PASS** (**193 / 193 tests passed**) | **100%** |
 
 ---
 
-## 8. Remaining Limitations & Next Phase Dependencies
-- **Automated Network Pull/Feed Sync**: Phase 6 implements push-based real-time webhook ingestion. Batch CSV/API polling reports from networks are deferred to background automations (Phase 9).
-- **Automated Payout Disbursements**: While confirmed cashback credits the wallet, actual bank payout processing and withdrawal requests are owned by Phase 7 / 8.
-- **Frontend Conversion Dashboard**: Conversions are accessible via Admin APIs and User Wallet Summaries; dedicated user-facing conversion detail views can be added in Phase 11.
+## 9. Remaining Limitations & Next Phase Dependencies
+- **Automated Network Pull/Feed Sync**: Webhook ingestion operates cleanly in real time. Batch conversion report polling (CSV/API feeds) is managed via cron/scheduled automations.
+- **Automated Payout Disbursements**: While confirmed cashback credits the wallet, actual bank payout processing, withdrawal request approvals, and payment gateway transfers are owned by Phase 8.
+- **Frontend Campaign & Conversion Views**: Campaign management and detailed conversion analytics are fully operational via Admin APIs and User Wallet Summaries; dedicated administrative UI tables will be completed in Phase 11.
 
 ---
 
-## 9. Recommended Next Phase
-- **Phase 7: Cashback Lifecycle Completion & Automated Reconciliations** (or Phase 8: Payout System)
+## 10. Recommended Next Phase
+- **Phase 8: Payout Processing Engine**
   - User withdrawal request workflows.
-  - Minimum withdrawal limits and verification.
+  - Minimum withdrawal limits and payout verification.
   - Bank and UPI payout disbursement queue.
   - Batch payout file generation or automated payment gateway integration.

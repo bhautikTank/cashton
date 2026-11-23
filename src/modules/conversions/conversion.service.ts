@@ -1,7 +1,13 @@
 import { prisma } from "@/src/lib/prisma";
-import { Prisma, AffiliateProvider, ConversionStatus } from "@/src/generated/prisma/client";
+import {
+  Prisma,
+  AffiliateProvider,
+  ConversionStatus,
+  CampaignShareType,
+} from "@/src/generated/prisma/client";
 import { getAdapter, WebhookHeaders, NormalizedConversionPayload } from "./adapters";
 import { updateCashbackStatus } from "@/src/modules/cashback/cashback.service";
+import { calculateCashbackForConversion } from "@/src/modules/campaigns/campaign.service";
 import type {
   AdminConversionsQueryInput,
   AdminConversionsSummaryQueryInput,
@@ -79,12 +85,38 @@ export async function ingestNormalizedConversion(
   const matchedMerchantId = matchedClick ? matchedClick.merchantId : null;
   const matchedDealId = matchedClick ? matchedClick.dealId : null;
 
-  // 2. Calculate Cashback (70% of network commission for registered users; updated in Part C)
+  // 2. Calculate Cashback via Campaign Engine (or fallback to platform baseline)
   let calculatedCashback = new Prisma.Decimal("0.00");
-  if (matchedUserId && effectiveStatus !== "UNMATCHED" && commissionAmount.greaterThan(0)) {
-    calculatedCashback = commissionAmount
-      .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
-      .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+  let matchedCampaignId: string | null = null;
+  let matchedShareType: CampaignShareType | null = null;
+  let matchedShareValue: Prisma.Decimal | null = null;
+  let campaignSnapshot: Prisma.InputJsonValue | null = null;
+  let calculationNote: string | null = null;
+
+  if (matchedUserId && effectiveStatus !== "UNMATCHED") {
+    const calc = await calculateCashbackForConversion({
+      orderAmount,
+      dealId: matchedDealId,
+      merchantId: matchedMerchantId,
+      network: payload.provider,
+      convertedAt: payload.convertedAt || new Date(),
+      userId: matchedUserId,
+    });
+
+    if (calc.isEligible && calc.campaign) {
+      calculatedCashback = calc.cashbackAmount;
+      matchedCampaignId = calc.campaign.id;
+      matchedShareType = calc.campaign.shareType;
+      matchedShareValue = calc.campaign.userShareValue;
+      campaignSnapshot = calc.snapshot as unknown as Prisma.InputJsonValue;
+    } else if (!calc.campaign && commissionAmount.greaterThan(0)) {
+      // Platform default baseline share when no explicit campaign rule is configured
+      calculatedCashback = commissionAmount
+        .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
+        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+    } else if (calc.ineligibilityReason) {
+      calculationNote = calc.ineligibilityReason;
+    }
   }
 
   // 3. Atomic Upsert & Lifecycle State Machine
@@ -207,6 +239,8 @@ export async function ingestNormalizedConversion(
     ? `Unmatched conversion: clickId '${payload.clickId || "none"}' not found.`
     : !matchedUserId
     ? `Guest click attribution: no registered user attached to click ${payload.clickId}`
+    : calculationNote
+    ? `${payload.notes ? payload.notes + " | " : ""}${calculationNote}`
     : payload.notes || null;
 
   const conversion = await prisma.conversion.create({
@@ -218,6 +252,9 @@ export async function ingestNormalizedConversion(
       merchantId: matchedMerchantId,
       dealId: matchedDealId,
       cashbackId: createdCashbackId,
+      campaignId: matchedCampaignId,
+      shareType: matchedShareType,
+      userShareValue: matchedShareValue,
       orderAmount,
       commissionAmount,
       cashbackAmount: calculatedCashback,
@@ -225,6 +262,7 @@ export async function ingestNormalizedConversion(
       status: effectiveStatus,
       convertedAt: payload.convertedAt || new Date(),
       rawPayload: payload.rawPayload ? (payload.rawPayload as Prisma.InputJsonValue) : Prisma.JsonNull,
+      campaignSnapshot: campaignSnapshot ? campaignSnapshot : Prisma.JsonNull,
       reconciliationNotes,
     },
   });
@@ -582,12 +620,35 @@ export async function reconcileConversion(id: string, input: ReconcileConversion
     newDealId = click.dealId ?? newDealId;
   }
 
-  // Recalculate cashback amount
+  // Recalculate cashback amount via Campaign Engine
   let newCashbackAmount = conversion.cashbackAmount;
-  if (newUserId && conversion.commissionAmount.greaterThan(0)) {
-    newCashbackAmount = conversion.commissionAmount
-      .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
-      .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+  let matchedCampaignId = conversion.campaignId;
+  let matchedShareType = conversion.shareType;
+  let matchedShareValue = conversion.userShareValue;
+  let campaignSnapshot: Prisma.InputJsonValue | undefined =
+    conversion.campaignSnapshot === null ? undefined : (conversion.campaignSnapshot as Prisma.InputJsonValue);
+
+  if (newUserId) {
+    const calc = await calculateCashbackForConversion({
+      orderAmount: conversion.orderAmount,
+      dealId: newDealId,
+      merchantId: newMerchantId,
+      network: conversion.provider,
+      convertedAt: conversion.convertedAt,
+      userId: newUserId,
+    });
+
+    if (calc.isEligible && calc.campaign) {
+      newCashbackAmount = calc.cashbackAmount;
+      matchedCampaignId = calc.campaign.id;
+      matchedShareType = calc.campaign.shareType;
+      matchedShareValue = calc.campaign.userShareValue;
+      campaignSnapshot = calc.snapshot as unknown as Prisma.InputJsonValue;
+    } else if (!calc.campaign && conversion.commissionAmount.greaterThan(0)) {
+      newCashbackAmount = conversion.commissionAmount
+        .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
+        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+    }
   }
 
   const targetStatus: ConversionStatus =
@@ -629,6 +690,10 @@ export async function reconcileConversion(id: string, input: ReconcileConversion
       userId: newUserId,
       merchantId: newMerchantId,
       dealId: newDealId,
+      campaignId: matchedCampaignId,
+      shareType: matchedShareType,
+      userShareValue: matchedShareValue,
+      campaignSnapshot: campaignSnapshot ? (campaignSnapshot as Prisma.InputJsonValue) : Prisma.JsonNull,
       cashbackId,
       cashbackAmount: newCashbackAmount,
       status: targetStatus,
