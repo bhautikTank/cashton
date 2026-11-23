@@ -13,9 +13,9 @@ Last Updated: 2026-11-19
 | **Phase 2** | **User Profile Management** | **COMPLETED** | `GET` and `PATCH /api/users/profile`. Profile sanitization (suppresses `authUserId` and `passwordHash`). Strict single-field mutation (`name`). P2025 and controlled 500 error handling. |
 | **Phase 3** | **Merchant Management** | **COMPLETED** | `Merchant` model and migration applied. Public read APIs, Admin CRUD with soft-deactivation (`isActive = false`), duplicate slug handling (409 Conflict), Zod validation, and full HTTP test suite passed. |
 | **User Info & Wallet** | **Mobile, Payout, Cashback & Wallet Foundation** | **COMPLETED** | Compulsory normalized Indian mobile numbers, AES-256-GCM bank details encryption & masking, `Cashback` lifecycle tracking, `Wallet` & append-only `WalletTransaction` ledger, `GET /api/wallet/summary`, responsive dashboard UI (`/dashboard`, `/wallet`), and automated test suite. |
-| **Phase 4** | **Deals & Coupons Management** | **PLANNED** | Models and endpoints for store deals, coupon codes, expiry dates, and public feeds. |
-| **Phase 5** | **Affiliate Tracking & Redirect Engine** | **PLANNED** | `ClickRecord` tracking, sub-ID generation, dynamic redirects, and click logging. |
-| **Phase 6** | **Cashback Network Postbacks** | **PLANNED** | Affiliate network postback receivers to automatically ingest tracked sales into `Cashback`. |
+| **Phase 4** | **Deals & Coupons Management** | **COMPLETED** | `Deal` and `Coupon` models with migration deployed, Decimal financial precision, strict Zod validation (`dealPrice <= originalPrice`, `discountValue`, date ranges, usage limits, strict mass-assignment protection), Admin CRUD with soft-deactivation (`isActive = false`), Public listing & slug/id lookup with date validity & inactive merchant cascading suppression, and 36/36 end-to-end integration tests passed. |
+| **Phase 5** | **Affiliate Tracking & Redirect Engine** | **COMPLETED** | `AffiliateClick` model and migration deployed (`20261120170000_create_affiliate_click`). CSPRNG opaque tracking IDs (`clk_...`), server-side destination resolution, open-redirect defense, rate limiting, duplicate redirect handling, and Admin analytics & summary endpoints. 33/33 integration tests passed. |
+| **Phase 6** | **Affiliate Network Integration & Conversion Tracking** | **COMPLETED** | Multi-network postbacks (`FLIPKART`, `CUELINKS`, `ADMITAD`, `EARNKARO`, `GENERIC`), click attribution, `Conversion` model & migration deployed (`20261123120000_create_conversions`), idempotent deduplication (`@@unique([provider, externalTransactionId])`), lifecycle state machine, atomic wallet crediting on `CONFIRMED`, atomic reversals on `REVERSED`, UNMATCHED conversion manual reconciliation, and 39/39 tests passed. |
 | **Phase 7** | **Payout Processing Engine** | **PLANNED** | Admin payout queue approval workflows, batch bank transfers, and withdrawal processing. |
 
 ---
@@ -146,8 +146,238 @@ Last Updated: 2026-11-19
 
 ---
 
-## 5. Recommended Next Phase
-- **Phase 4: Deals & Coupons Management**
-  - Implement `Deal` and `Coupon` models with foreign key `merchantId -> Merchant.id` (`onDelete: Restrict`).
-  - Public deals catalog with filtering by merchant slug, category, and expiry date.
-  - Admin CRUD endpoints for store promotions and discount codes.
+## 4. Phase 4: Deals & Coupons Management (Backend)
+
+### A. Database Migration
+- **Migration Name:** `20261120140000_create_deals_and_coupons`
+- **Migration Path:** `prisma/migrations/20261120140000_create_deals_and_coupons/migration.sql`
+- **Deployment Status:** Successfully deployed to Supabase PostgreSQL (`aws-1-ap-northeast-1.pooler.supabase.com:5432`) via `npx prisma migrate deploy`.
+- **Client Status:** Generated to `src/generated/prisma`.
+
+### B. New Database Models & Relations
+1. **DiscountType Enum**: `PERCENTAGE`, `FIXED`.
+2. **Deal Model**:
+   - `id`: `String @id @default(uuid())`
+   - `merchantId`: `String` (foreign key to `Merchant`, `onDelete: Cascade`)
+   - `title`: `String`
+   - `slug`: `String @unique` (lowercase alphanumeric with single hyphens)
+   - `description`: `String?`
+   - `imageUrl`: `String?` (valid HTTP/HTTPS URL)
+   - `originalPrice`: `Decimal? @db.Decimal(10, 2)`
+   - `dealPrice`: `Decimal? @db.Decimal(10, 2)`
+   - `affiliateUrl`: `String?` (valid HTTP/HTTPS URL)
+   - `startDate`: `DateTime?`
+   - `endDate`: `DateTime?`
+   - `isActive`: `Boolean @default(true)`
+   - Timestamps: `createdAt`, `updatedAt`
+   - Indexes: `[merchantId]`, `[isActive]`, `[startDate, endDate]`, `[createdAt]`
+3. **Coupon Model**:
+   - `id`: `String @id @default(uuid())`
+   - `merchantId`: `String` (foreign key to `Merchant`, `onDelete: Cascade`)
+   - `title`: `String`
+   - `code`: `String` (automatically normalized to uppercase)
+   - `description`: `String?`
+   - `discountType`: `DiscountType` (`PERCENTAGE`, `FIXED`)
+   - `discountValue`: `Decimal @db.Decimal(10, 2)`
+   - `minimumPurchase`: `Decimal? @db.Decimal(10, 2)`
+   - `maximumDiscount`: `Decimal? @db.Decimal(10, 2)`
+   - `usageLimit`: `Int?`
+   - `startDate`: `DateTime?`
+   - `endDate`: `DateTime?`
+   - `isActive`: `Boolean @default(true)`
+   - Timestamps: `createdAt`, `updatedAt`
+   - Constraints & Indexes: `@@unique([merchantId, code])`, `[code]`, `[merchantId]`, `[isActive]`, `[startDate, endDate]`, `[createdAt]`
+
+### C. Validation & Service Rules
+- **Strict Zod Schemas**: `.strict()` ensures mass-assignment attacks and unrecognized payload properties are rejected with 400 Bad Request.
+- **Deal Pricing Rule**: Strictly enforces `dealPrice <= originalPrice`.
+- **Discount Value Bounds**: Enforces `0 < discountValue <= 100` for `PERCENTAGE` discounts, and `discountValue > 0` for `FIXED` discounts.
+- **Usage Limits**: Enforces `usageLimit >= 1` integer.
+- **Date Range Sanity**: Enforces `endDate >= startDate`.
+- **Public Visibility Filtering**:
+  - `isActive === true` strictly required.
+  - Merchant status cascade: `merchant: { isActive: true }` strictly required. Offers belonging to inactive merchants are concealed.
+  - Date validity window: `(startDate === null || startDate <= now) && (endDate === null || endDate >= now)` strictly required. Expired and future offers are concealed.
+  - Direct detail route (`/api/deals/[slug]` and `/api/coupons/[id]`): returns 404 for inactive, expired, future, or inactive-merchant offers.
+- **Admin Full Oversight**:
+  - Requires `requireAdmin()`.
+  - Admin list and detail endpoints can retrieve all offers (active, inactive, expired, and future).
+  - Admin `DELETE` performs soft-deactivation (`isActive = false`), never hard-deleting records.
+
+### D. Implemented API Endpoints
+| Endpoint | Method | Access Level | Description |
+|---|:---:|:---:|---|
+| `/api/admin/deals` | `GET` | Admin | Lists all deals (active, inactive, all date ranges) with filtering by merchant, status, and search query. |
+| `/api/admin/deals` | `POST` | Admin | Creates a new store deal with strict validation and 409 conflict detection for duplicate slugs. |
+| `/api/admin/deals/[id]` | `GET` | Admin | Fetches deal details for any deal by ID. |
+| `/api/admin/deals/[id]` | `PATCH` | Admin | Updates deal fields with cross-field price/date sanity validation against existing values. |
+| `/api/admin/deals/[id]` | `DELETE` | Admin | Soft-deactivates deal (`isActive = false`). |
+| `/api/admin/coupons` | `GET` | Admin | Lists all coupons with discount type, merchant, and status filtering. |
+| `/api/admin/coupons` | `POST` | Admin | Creates a new coupon with uppercase normalization and per-merchant uniqueness (409 conflict). |
+| `/api/admin/coupons/[id]` | `GET` | Admin | Fetches coupon details for any coupon by ID. |
+| `/api/admin/coupons/[id]` | `PATCH` | Admin | Updates coupon fields with cross-field discount sanity validation against existing values. |
+| `/api/admin/coupons/[id]` | `DELETE` | Admin | Soft-deactivates coupon (`isActive = false`). |
+| `/api/deals` | `GET` | Public | Lists active, current deals from active merchants. Supports pagination, search, merchant filter, and sorting. |
+| `/api/deals/[slug]` | `GET` | Public | Retrieves active, unexpired deal by unique slug with active merchant. Returns 404 for expired/inactive. |
+| `/api/coupons` | `GET` | Public | Lists active, current coupons from active merchants. Supports pagination, search, discountType, and sorting. |
+| `/api/coupons/[id]` | `GET` | Public | Retrieves active, unexpired coupon by ID with active merchant. Returns 404 for expired/inactive. |
+
+---
+
+## 5. Quality & Verification Results
+
+| Quality Check | Command | Result |
+|---|---|:---:|
+| **Prisma Schema Validation** | `npx prisma validate --config prisma7.config.ts` | **PASS** (Exit 0) |
+| **Prisma Client Generation** | `npx prisma generate --config prisma7.config.ts` | **PASS** (Exit 0) |
+| **TypeScript Typecheck** | `npx tsc --noEmit` | **PASS** (0 errors) |
+| **ESLint Static Analysis** | `npm run lint` | **PASS** (0 errors, 0 warnings) |
+| **Next.js Production Build** | `npx next build --webpack` | **PASS** (22/22 routes compiled & verified) |
+| **Phase 4 End-to-End Suite** | `node scripts/test-phase4.mjs` | **PASS** (36/36 tests passed, 100%) |
+| **Wallet & Cashback Regression Suite** | `node scripts/test-runner.mjs` | **PASS** (15/15 tests passed, 100%) |
+| **Adversarial & Chaos Security Suite** | `node scripts/chaos-security-tester.mjs` | **PASS** (55/55 scenarios passed, 100% resilience) |
+
+---
+
+## 5. Phase 5: Affiliate Click Tracking & Secure Redirect Engine (Backend Only)
+
+### A. Database Migration
+- **Migration Name:** `20261120170000_create_affiliate_click`
+- **Migration Path:** `prisma/migrations/20261120170000_create_affiliate_click/migration.sql`
+- **Deployment Status:** Successfully deployed to Supabase PostgreSQL (`aws-1-ap-northeast-1.pooler.supabase.com:5432`) via `npx prisma migrate deploy`.
+- **Client Status:** Generated to `src/generated/prisma`.
+
+### B. New Database Models & Enums
+1. **ClickStatus Enum**: `TRACKED`, `REDIRECTED`, `FAILED`.
+2. **AffiliateClick Model**:
+   - `id`: `String @id @default(uuid())`
+   - `clickId`: `String @unique` (CSPRNG 192-bit entropy opaque token with `clk_` prefix)
+   - `userId`: `String?` (Relation to `User`, `onDelete: SetNull` to preserve historical clicks upon user account deletion)
+   - `dealId`: `String` (Relation to `Deal`, `onDelete: Cascade`)
+   - `merchantId`: `String` (Relation to `Merchant`, `onDelete: Cascade`)
+   - `clickedAt`: `DateTime @default(now())`
+   - `source`: `String?` (Sanitized traffic source identifier, max 50 chars)
+   - `landingDestination`: `String` (Server-side resolved trusted destination URL)
+   - `status`: `ClickStatus @default(TRACKED)`
+   - Timestamps: `createdAt`, `updatedAt`
+   - Performance Indexes: `[clickId]`, `[userId, clickedAt]`, `[dealId, clickedAt]`, `[merchantId, clickedAt]`, `[status, clickedAt]`
+
+### C. Security Controls & Architectural Guarantees
+- **Opaque CSPRNG Tracking Tokens**: 24 bytes of cryptographically secure random bytes (`crypto.randomBytes(24).toString("hex")`) prefixed with `clk_`. Completely unpredictable, collision-resistant, and immune to enumeration/sequential ID guessing attacks.
+- **Server-Side Attribution**: Client requests can never supply or spoof `userId`, `merchantId`, or `clickId`. User identity is extracted strictly from the verified HTTP-only Supabase session cookie (`getCurrentUser()`). Anonymous clicks have `userId: null`.
+- **Zero Open-Redirect Vulnerability**: Destination URLs are resolved exclusively from trusted database fields (`Deal.affiliateUrl` or `Merchant.websiteUrl`). Query parameter redirect overrides (`?url=...`, `?dest=...`) are completely ignored.
+- **Strict Protocol & Scheme Whitelisting**: Only `http:` and `https:` schemes are allowed. Unsafe schemes (`javascript:`, `data:`, `file:`, `vbscript:`, `blob:`) are rejected immediately. Malformed hostnames, whitespace, control characters, and backslashes (`\`) are blocked.
+- **In-Memory Rate Limiting**: Token-bucket sliding window rate limiter protects `POST /api/deals/[slug]/click` against scraping and click-flooding (60 requests/minute per client).
+- **Cache-Control & Security Headers**: Redirection responses (`GET /api/go/[clickId]`) emit `Cache-Control: no-store, no-cache, must-revalidate`, `Pragma: no-cache`, `Expires: 0`, and `X-Content-Type-Options: nosniff`.
+- **Idempotent Duplicate Redirect Handling**: Re-accessing an already redirected click ID continues to redirect smoothly without throwing server errors, while preserving audit status.
+- **Historical Audit Trail Integrity**: Deactivating deals or updating merchant information preserves all historical click records. User deletion cascades to `SetNull` without destroying analytics history.
+- **RBAC Enforcement**: Admin analytics endpoints strictly require `ADMIN` or `SUPER_ADMIN` roles (`requireAdmin()`). Public access and standard user attempts receive 401 Unauthorized / 403 Forbidden.
+
+### D. Implemented API Endpoints
+| Endpoint | Method | Access Level | Description |
+|---|:---:|:---:|---|
+| `/api/deals/[slug]/click` | `POST` | Public / Authenticated | Records an affiliate click for a deal (supports lookup by deal UUID or deal slug). Returns `clickId` and `redirectUrl`. Rate-limited. |
+| `/api/go/[clickId]` | `GET` | Public | Resolves click tracking ID, verifies offer eligibility, transitions status to `REDIRECTED`, and performs secure HTTP 307 redirect to approved destination. |
+| `/api/admin/affiliate-clicks` | `GET` | Admin | Paginated list of affiliate clicks with date range, merchant, deal, and status filtering. Sanitizes relations (excludes sensitive user fields). |
+| `/api/admin/affiliate-clicks/summary` | `GET` | Admin | Aggregated analytics summary: total clicks, redirected, failed, tracked, distribution by top merchants, top deals, and daily click counts. |
+
+---
+
+## 6. Phase 6: Affiliate Network Integration & Conversion Tracking
+
+### A. Database Migration
+- **Migration Name:** `20261123120000_create_conversions`
+- **Migration Path:** `prisma/migrations/20261123120000_create_conversions/migration.sql`
+- **Deployment Status:** Successfully deployed to Supabase PostgreSQL (`aws-1-ap-northeast-1.pooler.supabase.com:5432`) via `npx prisma migrate deploy`.
+- **Client Status:** Generated to `src/generated/prisma`.
+
+### B. New Database Models & Enums
+1. **AffiliateProvider Enum**: `FLIPKART`, `CUELINKS`, `ADMITAD`, `EARNKARO`, `GENERIC`.
+2. **ConversionStatus Enum**: `PENDING`, `APPROVED`, `CONFIRMED`, `REJECTED`, `REVERSED`, `UNMATCHED`.
+3. **Conversion Model**:
+   - `id String @id @default(uuid())`
+   - `provider AffiliateProvider`
+   - `externalTransactionId String`
+   - `affiliateClickId String?` (Relation to `AffiliateClick`, onDelete: `SetNull`)
+   - `userId String?` (Relation to `User`, onDelete: `SetNull`)
+   - `merchantId String?` (Relation to `Merchant`, onDelete: `SetNull`)
+   - `dealId String?` (Relation to `Deal`, onDelete: `SetNull`)
+   - `cashbackId String? @unique` (1:1 Relation to `Cashback`, onDelete: `SetNull`)
+   - `orderAmount Decimal(10, 2)` (Total purchase order volume)
+   - `commissionAmount Decimal(10, 2)` (Commission paid to CashTon by network)
+   - `cashbackAmount Decimal(10, 2) @default(0.00)` (Calculated 70% user cashback share)
+   - `currency String @default("INR")`
+   - `status ConversionStatus @default(PENDING)`
+   - `convertedAt DateTime @default(now())`
+   - `rawPayload Json?` (Full network postback payload for non-repudiation)
+   - `reconciliationNotes String?` (Audit commentary and reconciliation logs)
+   - `createdAt DateTime @default(now())`
+   - `updatedAt DateTime @updatedAt`
+   - **Constraints & Indexes**:
+     - `@@unique([provider, externalTransactionId])` (Strict database-level postback idempotency)
+     - `@@index([provider, externalTransactionId])`
+     - `@@index([affiliateClickId])`, `@@index([userId])`, `@@index([merchantId])`, `@@index([dealId])`
+     - `@@index([status])`, `@@index([createdAt])`
+
+### C. Architecture & Business Rules
+- **Multi-Network Adapter Pattern**: Modular network adapters (`FlipkartAdapter`, `CuelinksAdapter`, `AdmitadAdapter`, `EarnKaroAdapter`, `GenericAdapter`) implement the common `AffiliateNetworkAdapter` interface.
+- **Timing-Safe HMAC Verification**: Webhook secret tokens and signatures (`X-Flipkart-Signature`, `X-Flipkart-Token`, `X-Cuelinks-Token`, etc.) are authenticated using constant-time `crypto.timingSafeEqual`.
+- **Accurate Click Extraction**: Accurately extracts CashTon 48-hex CSPRNG click tokens (`clk_[a-f0-9]{48}`) from complex network sub-id structures (e.g. Flipkart composite parameters: `543212_136_{tid}_source`) without swallowing delimiters or trailing parameters.
+- **Strict Postback Idempotency**: Duplicate webhook deliveries are detected via `@@unique([provider, externalTransactionId])` and return HTTP 200 with `isDuplicate: true`, preventing duplicate conversions, duplicate cashback records, and double wallet crediting.
+- **Cashback Lifecycle Synchronization**:
+  - `PENDING` / `APPROVED` postbacks create or transition `Cashback` records without prematurely crediting the wallet.
+  - `CONFIRMED` postbacks atomically credit the user's `Wallet` using `creditCashbackToWallet` inside a Prisma transaction and create an immutable `WalletTransaction` of type `CREDIT`.
+  - Duplicate `CONFIRMED` postbacks are strictly no-ops (protected by `WalletTransaction.cashbackId @unique`).
+  - `REVERSED` postbacks on confirmed orders atomically decrement the user wallet and record a `WalletTransaction` of type `REVERSAL`.
+  - `REJECTED` postbacks safely transition the cashback to `REJECTED` with the network rejection reason.
+- **Guest Click Attribution**: Clicks generated by anonymous visitors create conversions with `userId: null` and `cashbackId: null` for platform commission auditing.
+- **Unmatched Postback Handling**: Postbacks with missing or unknown click IDs are safely recorded with status `UNMATCHED` and flagged for manual administration.
+- **Admin Manual Reconciliation**: Dedicated reconciliation endpoint allows administrators to attach a valid `clickId` to an `UNMATCHED` conversion, automatically generating user cashback and synchronizing ledger state.
+
+### D. Implemented API Endpoints
+| Endpoint | Method | Access Level | Description |
+|---|:---:|:---:|---|
+| `/api/webhooks/flipkart` | `POST` / `GET` | Public (Authenticated via Secret/HMAC) | Ingests Flipkart conversion postbacks. Parses `affExtParam2`, validates HMAC signature, and synchronizes cashback. |
+| `/api/webhooks/cuelinks` | `POST` / `GET` | Public (Authenticated via Secret/Token) | Ingests Cuelinks conversion postbacks with `subid` click attribution. |
+| `/api/webhooks/admitad` | `POST` / `GET` | Public (Authenticated via Secret/Token) | Ingests Admitad conversion postbacks with `subid` click attribution. |
+| `/api/webhooks/earnkaro` | `POST` / `GET` | Public (Authenticated via Secret/Token) | Ingests EarnKaro conversion postbacks with `subid` click attribution. |
+| `/api/webhooks/generic` | `POST` / `GET` | Public (Authenticated via Secret/Token) | Universal webhook endpoint for generic affiliate network postbacks. |
+| `/api/admin/conversions` | `GET` | Admin | Paginated list of conversions with provider, status, date, and user filtering, plus full relational details. |
+| `/api/admin/conversions/[id]` | `GET` | Admin | Full conversion details including raw JSON audit payload and linked cashback/wallet transactions. |
+| `/api/admin/conversions/summary` | `GET` | Admin | Aggregated metrics: total conversions, order volume, commissions, user cashback, and provider breakdown. |
+| `/api/admin/conversions/[id]/reconcile` | `POST` | Admin | Reconciles unmatched or misattributed conversions by attaching a click ID or user ID and creating cashback. |
+
+---
+
+## 7. Comprehensive Test Results Matrix
+
+| Quality / Test Suite | Command | Result | Pass Rate |
+|---|---|:---:|:---:|
+| **Prisma Schema Validation** | `npx prisma validate --config prisma7.config.ts` | **PASS** (Exit 0) | 100% |
+| **Prisma Client Generation** | `npx prisma generate --config prisma7.config.ts` | **PASS** (Exit 0) | 100% |
+| **Prisma Migration Status** | `npx prisma migrate status --config prisma7.config.ts` | **PASS** (7 applied, 0 drift) | 100% |
+| **TypeScript Typecheck** | `npx tsc --noEmit` | **PASS** (0 errors) | 100% |
+| **ESLint Static Analysis** | `npm run lint` | **PASS** (0 errors, 0 warnings) | 100% |
+| **Next.js Production Build** | `npx next build --webpack` | **PASS** (31/31 routes compiled) | 100% |
+| **Phase 6 Network & Conversion Suite** | `node scripts/test-phase6.mjs` | **PASS** (39/39 scenarios passed) | **100%** |
+| **Phase 5 Click & Redirect Suite** | `node scripts/test-phase5.mjs` | **PASS** (33/33 scenarios passed) | **100%** |
+| **Phase 4 Deals & Coupons Suite** | `node scripts/test-phase4.mjs` | **PASS** (36/36 scenarios passed) | **100%** |
+| **Wallet & Cashback Lifecycle Suite** | `node scripts/test-runner.mjs` | **PASS** (15/15 scenarios passed) | **100%** |
+| **Adversarial & Chaos Security Suite** | `node scripts/chaos-security-tester.mjs` | **PASS** (55/55 scenarios passed) | **100%** |
+| **Combined Regression Matrix** | **Full System Verification** | **PASS** (**178 / 178 tests passed**) | **100%** |
+
+---
+
+## 8. Remaining Limitations & Next Phase Dependencies
+- **Automated Network Pull/Feed Sync**: Phase 6 implements push-based real-time webhook ingestion. Batch CSV/API polling reports from networks are deferred to background automations (Phase 9).
+- **Automated Payout Disbursements**: While confirmed cashback credits the wallet, actual bank payout processing and withdrawal requests are owned by Phase 7 / 8.
+- **Frontend Conversion Dashboard**: Conversions are accessible via Admin APIs and User Wallet Summaries; dedicated user-facing conversion detail views can be added in Phase 11.
+
+---
+
+## 9. Recommended Next Phase
+- **Phase 7: Cashback Lifecycle Completion & Automated Reconciliations** (or Phase 8: Payout System)
+  - User withdrawal request workflows.
+  - Minimum withdrawal limits and verification.
+  - Bank and UPI payout disbursement queue.
+  - Batch payout file generation or automated payment gateway integration.
