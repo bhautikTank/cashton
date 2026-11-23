@@ -3,6 +3,7 @@ import type {
   CreateMerchantInput,
   UpdateMerchantInput,
   MerchantQueryInput,
+  AdminMerchantQueryInput,
 } from "@/src/lib/validations/merchant.schema";
 import type { Merchant } from "@/src/generated/prisma/client";
 
@@ -40,6 +41,47 @@ export async function getMerchants(
       skip,
       take: limit,
       orderBy: { createdAt: "desc" },
+    }),
+    prisma.merchant.count({ where }),
+  ]);
+
+  return {
+    merchants,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit) || 1,
+    },
+  };
+}
+
+export async function getAdminMerchants(
+  query: AdminMerchantQueryInput
+): Promise<PaginatedMerchantsResponse> {
+  const { page, limit, search, isActive, sortBy = "createdAt", sortOrder = "desc" } = query;
+  const skip = (page - 1) * limit;
+
+  const where: Record<string, unknown> = {};
+
+  if (isActive !== undefined) {
+    where.isActive = isActive;
+  }
+
+  if (search) {
+    where.OR = [
+      { name: { contains: search, mode: "insensitive" } },
+      { slug: { contains: search, mode: "insensitive" } },
+      { description: { contains: search, mode: "insensitive" } },
+    ];
+  }
+
+  const [merchants, total] = await Promise.all([
+    prisma.merchant.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { [sortBy]: sortOrder },
     }),
     prisma.merchant.count({ where }),
   ]);

@@ -106,6 +106,16 @@ export const merchantQuerySchema = z.object({
     .optional(),
 });
 
+export const adminMerchantQuerySchema = merchantQuerySchema.extend({
+  isActive: z
+    .enum(["true", "false"])
+    .transform((val) => val === "true")
+    .optional(),
+  sortBy: z.enum(["name", "createdAt", "updatedAt"]).default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+});
+
 export type CreateMerchantInput = z.infer<typeof createMerchantSchema>;
 export type UpdateMerchantInput = z.infer<typeof updateMerchantSchema>;
 export type MerchantQueryInput = z.infer<typeof merchantQuerySchema>;
+export type AdminMerchantQueryInput = z.infer<typeof adminMerchantQuerySchema>;
