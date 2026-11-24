@@ -29,7 +29,7 @@ export function isSafeRedirectUrl(urlStr: string): boolean {
     // Reject control characters, newlines, carriage returns, or backslashes
     if (/[\x00-\x1F\x7F\s\\]/.test(trimmed)) return false;
 
-    // Reject javascript:, data:, file:, vbscript:, etc. explicitly
+    // Reject javascript:, data:, file:, vbscript:, blob: explicitly
     const lower = trimmed.toLowerCase();
     if (
       lower.startsWith("javascript:") ||
@@ -47,8 +47,46 @@ export function isSafeRedirectUrl(urlStr: string): boolean {
       return false;
     }
 
+    const hostname = parsed.hostname.toLowerCase();
     // Hostname validation
-    if (!parsed.hostname || parsed.hostname.length < 3 || !parsed.hostname.includes(".")) {
+    if (!hostname || hostname.length < 3 || !hostname.includes(".")) {
+      return false;
+    }
+
+    // SSRF & Localhost Defense: Reject localhost, local domains, and internal names
+    if (
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".internal")
+    ) {
+      return false;
+    }
+
+    // SSRF Defense: Check for IPv4 addresses and block private/loopback/cloud-metadata ranges
+    const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+    const ipv4Match = hostname.match(ipv4Regex);
+    if (ipv4Match) {
+      const [, o1, o2, o3, o4] = ipv4Match.map(Number);
+      if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) return false;
+      // 0.0.0.0/8 (Broadcast/any)
+      if (o1 === 0) return false;
+      // 127.0.0.0/8 (Loopback)
+      if (o1 === 127) return false;
+      // 10.0.0.0/8 (RFC1918 Private)
+      if (o1 === 10) return false;
+      // 169.254.0.0/16 (Link-local & AWS/GCP/Azure/OCI Cloud Metadata: 169.254.169.254)
+      if (o1 === 169 && o2 === 254) return false;
+      // 172.16.0.0/12 (RFC1918 Private: 172.16.0.0 - 172.31.255.255)
+      if (o1 === 172 && o2 >= 16 && o2 <= 31) return false;
+      // 192.168.0.0/16 (RFC1918 Private)
+      if (o1 === 192 && o2 === 168) return false;
+      // 100.64.0.0/10 (Carrier-grade NAT)
+      if (o1 === 100 && o2 >= 64 && o2 <= 127) return false;
+    }
+
+    // SSRF Defense: Reject raw IPv6 literals (e.g. [::1], [fc00::])
+    if (hostname.startsWith("[") && hostname.endsWith("]")) {
       return false;
     }
 

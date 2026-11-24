@@ -1,5 +1,6 @@
 import { prisma } from "@/src/lib/prisma";
-import { Prisma, Campaign, AffiliateProvider, CampaignShareType } from "@/src/generated/prisma/client";
+import { Prisma, AffiliateProvider, CampaignShareType } from "@/src/generated/prisma/client";
+import type { Campaign } from "@/src/generated/prisma/client";
 import type {
   CreateCampaignInput,
   UpdateCampaignInput,
@@ -341,11 +342,13 @@ export async function selectEligibleCampaign(params: {
   merchantId?: string | null;
   network?: AffiliateProvider | null;
   convertedAt?: Date;
+  tx?: Prisma.TransactionClient;
 }): Promise<Campaign | null> {
   const convertedAt = params.convertedAt || new Date();
+  const db = params.tx ?? prisma;
 
   // Query all active candidate campaigns matching any applicable scope
-  const candidates = await prisma.campaign.findMany({
+  const candidates = await db.campaign.findMany({
     where: {
       isActive: true,
       OR: [
@@ -413,9 +416,11 @@ export async function calculateCashbackForConversion(params: {
   network?: AffiliateProvider | null;
   convertedAt?: Date;
   userId?: string | null;
+  tx?: Prisma.TransactionClient;
 }): Promise<CalculationResult> {
   const zero = new Prisma.Decimal("0.00");
   const orderAmount = params.orderAmount;
+  const db = params.tx ?? prisma;
 
   if (orderAmount.lessThanOrEqualTo(zero)) {
     return {
@@ -439,6 +444,11 @@ export async function calculateCashbackForConversion(params: {
     };
   }
 
+  // Row-level lock campaign if transaction client is provided to serialize budget checks
+  if (params.tx) {
+    await params.tx.$queryRaw`SELECT id FROM "Campaign" WHERE id = ${campaign.id} FOR UPDATE`;
+  }
+
   // 1. Minimum order amount check
   if (campaign.minOrderAmount && orderAmount.lessThan(campaign.minOrderAmount)) {
     return {
@@ -451,8 +461,9 @@ export async function calculateCashbackForConversion(params: {
   }
 
   // 2. Max Campaign Budget check
+  let campaignRemainingBudget: Prisma.Decimal | null = null;
   if (campaign.maxCampaignBudget) {
-    const budgetUsedAgg = await prisma.conversion.aggregate({
+    const budgetUsedAgg = await db.conversion.aggregate({
       where: {
         campaignId: campaign.id,
         status: { in: ["PENDING", "APPROVED", "CONFIRMED"] },
@@ -460,7 +471,8 @@ export async function calculateCashbackForConversion(params: {
       _sum: { cashbackAmount: true },
     });
     const budgetUsed = budgetUsedAgg._sum.cashbackAmount ?? zero;
-    if (budgetUsed.greaterThanOrEqualTo(campaign.maxCampaignBudget)) {
+    campaignRemainingBudget = campaign.maxCampaignBudget.sub(budgetUsed);
+    if (campaignRemainingBudget.lessThanOrEqualTo(zero)) {
       return {
         campaign,
         cashbackAmount: zero,
@@ -474,7 +486,7 @@ export async function calculateCashbackForConversion(params: {
   // 3. User Max Cashback Cap check
   let userRemainingCap: Prisma.Decimal | null = null;
   if (campaign.maxCashbackPerUser && params.userId) {
-    const userEarnedAgg = await prisma.conversion.aggregate({
+    const userEarnedAgg = await db.conversion.aggregate({
       where: {
         campaignId: campaign.id,
         userId: params.userId,
@@ -520,6 +532,11 @@ export async function calculateCashbackForConversion(params: {
   // 6. Apply User Remaining Cap
   if (userRemainingCap !== null) {
     calculatedAmount = Prisma.Decimal.min(calculatedAmount, userRemainingCap);
+  }
+
+  // 6b. Apply Campaign Total Budget Remaining Cap
+  if (campaignRemainingBudget !== null) {
+    calculatedAmount = Prisma.Decimal.min(calculatedAmount, campaignRemainingBudget);
   }
 
   // Final rounding guarantee

@@ -117,7 +117,8 @@ model User {
   wallet          Wallet?
   affiliateClicks AffiliateClick[]
   conversions     Conversion[]
-  debts           CashbackDebt[]
+  debts           CashbackDebt[]   @relation("UserDebts")
+  resolvedDebts   CashbackDebt[]   @relation("AdminDebtResolutions")
 }
 
 model Merchant {
@@ -399,18 +400,20 @@ model Campaign {
 model CashbackDebt {
   id                      String             @id @default(uuid())
   walletId                String
-  wallet                  Wallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  wallet                  Wallet             @relation(fields: [walletId], references: [id], onDelete: Restrict)
   userId                  String
-  user                    User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                    User               @relation("UserDebts", fields: [userId], references: [id], onDelete: Restrict)
   amount                  Decimal            @db.Decimal(10, 2)
   remainingAmount         Decimal            @db.Decimal(10, 2)
   status                  CashbackDebtStatus @default(OPEN)
+  idempotencyKey          String?            @unique
   originatingCashbackId   String?
-  originatingCashback     Cashback?          @relation(fields: [originatingCashbackId], references: [id], onDelete: SetNull)
+  originatingCashback     Cashback?          @relation(fields: [originatingCashbackId], references: [id], onDelete: Restrict)
   originatingConversionId String?
-  originatingConversion   Conversion?        @relation(fields: [originatingConversionId], references: [id], onDelete: SetNull)
+  originatingConversion   Conversion?        @relation(fields: [originatingConversionId], references: [id], onDelete: Restrict)
   reason                  String?
   resolvedByAdminId       String?
+  resolvedByAdmin         User?              @relation("AdminDebtResolutions", fields: [resolvedByAdminId], references: [id], onDelete: Restrict)
   resolvedAt              DateTime?
   notes                   String?
 
@@ -422,4 +425,5 @@ model CashbackDebt {
   @@index([walletId, status])
   @@index([userId])
   @@index([status])
+  @@index([resolvedByAdminId])
 }

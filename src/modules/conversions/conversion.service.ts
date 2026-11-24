@@ -5,7 +5,8 @@ import {
   ConversionStatus,
   CampaignShareType,
 } from "@/src/generated/prisma/client";
-import { getAdapter, WebhookHeaders, NormalizedConversionPayload } from "./adapters";
+import { getAdapter } from "./adapters";
+import type { WebhookHeaders, NormalizedConversionPayload } from "./adapters";
 import { updateCashbackStatus } from "@/src/modules/cashback/cashback.service";
 import { calculateCashbackForConversion } from "@/src/modules/campaigns/campaign.service";
 import type {
@@ -25,6 +26,20 @@ export class ConversionServiceError extends Error {
     this.statusCode = statusCode;
   }
 }
+
+/**
+ * Explicit state transition matrix for ConversionStatus.
+ * Mirrors CashbackStatus lifecycle guarantees and prevents illegal lifecycle jumps.
+ */
+export const VALID_CONVERSION_TRANSITIONS: Record<ConversionStatus, ConversionStatus[]> = {
+  PENDING: ["APPROVED", "CONFIRMED", "REJECTED"],
+  APPROVED: ["CONFIRMED", "REJECTED"],
+  CONFIRMED: ["REVERSED"],
+  REJECTED: [],
+  REVERSED: [],
+  UNMATCHED: ["PENDING", "APPROVED", "CONFIRMED", "REJECTED"],
+  NEEDS_CAMPAIGN_RULE: ["PENDING", "APPROVED", "CONFIRMED", "REJECTED"],
+};
 
 /**
  * Default user share of affiliate network commission (70%).
@@ -61,222 +76,240 @@ export async function ingestNormalizedConversion(
     );
   }
 
-  // 1. Resolve Click Attribution
-  let matchedClick: (Prisma.AffiliateClickGetPayload<{
-    include: { user: true; deal: true; merchant: true };
-  }>) | null = null;
+  return prisma.$transaction(async (tx) => {
+    // 1. Resolve Click Attribution
+    let matchedClick: (Prisma.AffiliateClickGetPayload<{
+      include: { user: true; deal: true; merchant: true };
+    }>) | null = null;
 
-  if (payload.clickId) {
-    matchedClick = await prisma.affiliateClick.findUnique({
-      where: { clickId: payload.clickId },
+    if (payload.clickId) {
+      matchedClick = await tx.affiliateClick.findUnique({
+        where: { clickId: payload.clickId },
+        include: {
+          user: true,
+          deal: true,
+          merchant: true,
+        },
+      });
+    }
+
+    const isClickMatched = Boolean(matchedClick);
+    const effectiveStatus: ConversionStatus = isClickMatched ? payload.status : "UNMATCHED";
+
+    const matchedClickId = matchedClick ? matchedClick.id : null;
+    const matchedUserId = matchedClick && matchedClick.userId ? matchedClick.userId : null;
+    const matchedMerchantId = matchedClick ? matchedClick.merchantId : null;
+    const matchedDealId = matchedClick ? matchedClick.dealId : null;
+
+    // 2. Atomic Upsert & Lifecycle State Machine
+    const existing = await tx.conversion.findUnique({
+      where: {
+        provider_externalTransactionId: {
+          provider: payload.provider,
+          externalTransactionId: payload.externalTransactionId,
+        },
+      },
       include: {
-        user: true,
-        deal: true,
-        merchant: true,
+        cashback: true,
       },
     });
-  }
 
-  const isClickMatched = Boolean(matchedClick);
-  const effectiveStatus: ConversionStatus = isClickMatched ? payload.status : "UNMATCHED";
+    if (existing) {
+      // Idempotent duplicate check
+      if (existing.status === payload.status) {
+        return {
+          conversionId: existing.id,
+          provider: existing.provider,
+          externalTransactionId: existing.externalTransactionId,
+          status: existing.status,
+          cashbackId: existing.cashbackId,
+          cashbackAmount: existing.cashbackAmount.toFixed(2),
+          isDuplicate: true,
+          isUnmatched: existing.status === "UNMATCHED",
+        };
+      }
 
-  const matchedClickId = matchedClick ? matchedClick.id : null;
-  const matchedUserId = matchedClick && matchedClick.userId ? matchedClick.userId : null;
-  const matchedMerchantId = matchedClick ? matchedClick.merchantId : null;
-  const matchedDealId = matchedClick ? matchedClick.dealId : null;
+      // Explicit transition matrix validation
+      const allowedNext = VALID_CONVERSION_TRANSITIONS[existing.status] || [];
+      if (!allowedNext.includes(payload.status)) {
+        throw new ConversionServiceError(
+          `Invalid conversion status transition from ${existing.status} to ${payload.status}`,
+          "INVALID_STATUS_TRANSITION",
+          400
+        );
+      }
 
-  // 2. Calculate Cashback via Campaign Engine (or fallback to platform baseline)
-  let calculatedCashback = new Prisma.Decimal("0.00");
-  let matchedCampaignId: string | null = null;
-  let matchedShareType: CampaignShareType | null = null;
-  let matchedShareValue: Prisma.Decimal | null = null;
-  let campaignSnapshot: Prisma.InputJsonValue | null = null;
-  let calculationNote: string | null = null;
-
-  if (matchedUserId && effectiveStatus !== "UNMATCHED") {
-    const calc = await calculateCashbackForConversion({
-      orderAmount,
-      dealId: matchedDealId,
-      merchantId: matchedMerchantId,
-      network: payload.provider,
-      convertedAt: payload.convertedAt || new Date(),
-      userId: matchedUserId,
-    });
-
-    if (calc.isEligible && calc.campaign) {
-      calculatedCashback = calc.cashbackAmount;
-      matchedCampaignId = calc.campaign.id;
-      matchedShareType = calc.campaign.shareType;
-      matchedShareValue = calc.campaign.userShareValue;
-      campaignSnapshot = calc.snapshot as unknown as Prisma.InputJsonValue;
-    } else if (!calc.campaign && commissionAmount.greaterThan(0)) {
-      // Platform default baseline share when no explicit campaign rule is configured
-      calculatedCashback = commissionAmount
-        .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
-        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
-    } else if (calc.ineligibilityReason) {
-      calculationNote = calc.ineligibilityReason;
-    }
-  }
-
-  // 3. Atomic Upsert & Lifecycle State Machine
-  const existing = await prisma.conversion.findUnique({
-    where: {
-      provider_externalTransactionId: {
-        provider: payload.provider,
-        externalTransactionId: payload.externalTransactionId,
-      },
-    },
-    include: {
-      cashback: true,
-    },
-  });
-
-  if (existing) {
-    const statusChanged = existing.status !== payload.status;
-
-    if (existing.status === "CONFIRMED" && payload.status === "CONFIRMED") {
-      return {
-        conversionId: existing.id,
-        provider: existing.provider,
-        externalTransactionId: existing.externalTransactionId,
-        status: existing.status,
-        cashbackId: existing.cashbackId,
-        cashbackAmount: existing.cashbackAmount.toFixed(2),
-        isDuplicate: true,
-        isUnmatched: false,
-      };
-    }
-
-    if (statusChanged && existing.cashbackId && existing.cashback) {
-      const cb = existing.cashback;
-      try {
+      // Synchronize associated Cashback status if one exists
+      if (existing.cashbackId && existing.cashback) {
+        const cb = existing.cashback;
         if (payload.status === "APPROVED" && cb.status === "PENDING") {
-          await updateCashbackStatus(cb.id, "APPROVED");
+          await updateCashbackStatus(cb.id, "APPROVED", undefined, { tx });
         } else if (payload.status === "CONFIRMED") {
           if (cb.status === "PENDING") {
-            await updateCashbackStatus(cb.id, "APPROVED");
+            await updateCashbackStatus(cb.id, "APPROVED", undefined, { tx });
           }
           if (cb.status !== "CONFIRMED" && cb.status !== "REVERSED") {
-            await updateCashbackStatus(cb.id, "CONFIRMED");
+            await updateCashbackStatus(cb.id, "CONFIRMED", undefined, {
+              provider: payload.provider,
+              tx,
+            });
           }
         } else if (payload.status === "REJECTED" && (cb.status === "PENDING" || cb.status === "APPROVED")) {
           await updateCashbackStatus(
             cb.id,
             "REJECTED",
-            payload.notes || "Rejected by affiliate network postback"
+            payload.notes || "Rejected by affiliate network postback",
+            { tx }
           );
         } else if (payload.status === "REVERSED" && cb.status === "CONFIRMED") {
+          const eventKey = `reversal:${payload.provider}:${payload.externalTransactionId}`;
           await updateCashbackStatus(
             cb.id,
             "REVERSED",
-            payload.notes || "Reversed / returned by affiliate network postback"
+            payload.notes || "Reversed / returned by affiliate network postback",
+            {
+              provider: payload.provider,
+              eventKey,
+              tx,
+            }
           );
         }
-      } catch (err: unknown) {
-        console.warn(`[ConversionService] Warning during cashback status sync: ${(err as Error).message}`);
+      }
+
+      const updated = await tx.conversion.update({
+        where: { id: existing.id },
+        data: {
+          status: payload.status,
+          orderAmount,
+          commissionAmount,
+          rawPayload: payload.rawPayload ? (payload.rawPayload as Prisma.InputJsonValue) : Prisma.JsonNull,
+          reconciliationNotes: payload.notes
+            ? `${existing.reconciliationNotes ? existing.reconciliationNotes + " | " : ""}${payload.notes}`
+            : existing.reconciliationNotes,
+        },
+      });
+
+      return {
+        conversionId: updated.id,
+        provider: updated.provider,
+        externalTransactionId: updated.externalTransactionId,
+        status: updated.status,
+        cashbackId: updated.cashbackId,
+        cashbackAmount: updated.cashbackAmount.toFixed(2),
+        isDuplicate: true,
+        isUnmatched: updated.status === "UNMATCHED",
+      };
+    }
+
+    // 3. New Conversion: Calculate Cashback with row-level campaign locking
+    let calculatedCashback = new Prisma.Decimal("0.00");
+    let matchedCampaignId: string | null = null;
+    let matchedShareType: CampaignShareType | null = null;
+    let matchedShareValue: Prisma.Decimal | null = null;
+    let campaignSnapshot: Prisma.InputJsonValue | null = null;
+    let calculationNote: string | null = null;
+
+    if (matchedUserId && effectiveStatus !== "UNMATCHED") {
+      const calc = await calculateCashbackForConversion({
+        orderAmount,
+        dealId: matchedDealId,
+        merchantId: matchedMerchantId,
+        network: payload.provider,
+        convertedAt: payload.convertedAt || new Date(),
+        userId: matchedUserId,
+        tx,
+      });
+
+      if (calc.isEligible && calc.campaign) {
+        calculatedCashback = calc.cashbackAmount;
+        matchedCampaignId = calc.campaign.id;
+        matchedShareType = calc.campaign.shareType;
+        matchedShareValue = calc.campaign.userShareValue;
+        campaignSnapshot = calc.snapshot as unknown as Prisma.InputJsonValue;
+      } else if (!calc.campaign && commissionAmount.greaterThan(0)) {
+        // Platform default baseline share when no explicit campaign rule is configured
+        calculatedCashback = commissionAmount
+          .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
+          .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+      } else if (calc.ineligibilityReason) {
+        calculationNote = calc.ineligibilityReason;
       }
     }
 
-    const updated = await prisma.conversion.update({
-      where: { id: existing.id },
+    let createdCashbackId: string | null = null;
+
+    if (matchedUserId && effectiveStatus !== "UNMATCHED" && calculatedCashback.greaterThan(0)) {
+      const extRef = `${payload.provider}_${payload.externalTransactionId}`;
+
+      const newCashback = await tx.cashback.create({
+        data: {
+          userId: matchedUserId,
+          merchantId: matchedMerchantId,
+          amount: calculatedCashback,
+          status: "PENDING",
+          externalReferenceId: extRef,
+          description: `Cashback from ${payload.provider} purchase (${payload.externalTransactionId})`,
+        },
+      });
+
+      createdCashbackId = newCashback.id;
+
+      if (effectiveStatus === "APPROVED") {
+        await updateCashbackStatus(newCashback.id, "APPROVED", undefined, { tx });
+      } else if (effectiveStatus === "CONFIRMED") {
+        await updateCashbackStatus(newCashback.id, "APPROVED", undefined, { tx });
+        await updateCashbackStatus(newCashback.id, "CONFIRMED", undefined, {
+          provider: payload.provider,
+          tx,
+        });
+      } else if (effectiveStatus === "REJECTED") {
+        await updateCashbackStatus(newCashback.id, "REJECTED", payload.notes || "Rejected at ingestion", { tx });
+      }
+    }
+
+    const reconciliationNotes = !isClickMatched
+      ? `Unmatched conversion: clickId '${payload.clickId || "none"}' not found.`
+      : !matchedUserId
+      ? `Guest click attribution: no registered user attached to click ${payload.clickId}`
+      : calculationNote
+      ? `${payload.notes ? payload.notes + " | " : ""}${calculationNote}`
+      : payload.notes || null;
+
+    const conversion = await tx.conversion.create({
       data: {
-        status: existing.status === "CONFIRMED" && payload.status !== "REVERSED" ? existing.status : payload.status,
+        provider: payload.provider,
+        externalTransactionId: payload.externalTransactionId,
+        affiliateClickId: matchedClickId,
+        userId: matchedUserId,
+        merchantId: matchedMerchantId,
+        dealId: matchedDealId,
+        cashbackId: createdCashbackId,
+        campaignId: matchedCampaignId,
+        shareType: matchedShareType,
+        userShareValue: matchedShareValue,
         orderAmount,
         commissionAmount,
+        cashbackAmount: calculatedCashback,
+        currency: payload.currency || "INR",
+        status: effectiveStatus,
+        convertedAt: payload.convertedAt || new Date(),
         rawPayload: payload.rawPayload ? (payload.rawPayload as Prisma.InputJsonValue) : Prisma.JsonNull,
-        reconciliationNotes: payload.notes
-          ? `${existing.reconciliationNotes ? existing.reconciliationNotes + " | " : ""}${payload.notes}`
-          : existing.reconciliationNotes,
+        campaignSnapshot: campaignSnapshot ? campaignSnapshot : Prisma.JsonNull,
+        reconciliationNotes,
       },
     });
 
     return {
-      conversionId: updated.id,
-      provider: updated.provider,
-      externalTransactionId: updated.externalTransactionId,
-      status: updated.status,
-      cashbackId: updated.cashbackId,
-      cashbackAmount: updated.cashbackAmount.toFixed(2),
-      isDuplicate: true,
-      isUnmatched: updated.status === "UNMATCHED",
+      conversionId: conversion.id,
+      provider: conversion.provider,
+      externalTransactionId: conversion.externalTransactionId,
+      status: conversion.status,
+      cashbackId: conversion.cashbackId,
+      cashbackAmount: conversion.cashbackAmount.toFixed(2),
+      isDuplicate: false,
+      isUnmatched: effectiveStatus === "UNMATCHED",
     };
-  }
-
-  let createdCashbackId: string | null = null;
-
-  if (matchedUserId && effectiveStatus !== "UNMATCHED" && calculatedCashback.greaterThan(0)) {
-    const extRef = `${payload.provider}_${payload.externalTransactionId}`;
-
-    const newCashback = await prisma.cashback.create({
-      data: {
-        userId: matchedUserId,
-        merchantId: matchedMerchantId,
-        amount: calculatedCashback,
-        status: "PENDING",
-        externalReferenceId: extRef,
-        description: `Cashback from ${payload.provider} purchase (${payload.externalTransactionId})`,
-      },
-    });
-
-    createdCashbackId = newCashback.id;
-
-    try {
-      if (effectiveStatus === "APPROVED") {
-        await updateCashbackStatus(newCashback.id, "APPROVED");
-      } else if (effectiveStatus === "CONFIRMED") {
-        await updateCashbackStatus(newCashback.id, "APPROVED");
-        await updateCashbackStatus(newCashback.id, "CONFIRMED");
-      } else if (effectiveStatus === "REJECTED") {
-        await updateCashbackStatus(newCashback.id, "REJECTED", payload.notes || "Rejected at ingestion");
-      }
-    } catch (err: unknown) {
-      console.warn(`[ConversionService] Warning during initial cashback status transition: ${(err as Error).message}`);
-    }
-  }
-
-  const reconciliationNotes = !isClickMatched
-    ? `Unmatched conversion: clickId '${payload.clickId || "none"}' not found.`
-    : !matchedUserId
-    ? `Guest click attribution: no registered user attached to click ${payload.clickId}`
-    : calculationNote
-    ? `${payload.notes ? payload.notes + " | " : ""}${calculationNote}`
-    : payload.notes || null;
-
-  const conversion = await prisma.conversion.create({
-    data: {
-      provider: payload.provider,
-      externalTransactionId: payload.externalTransactionId,
-      affiliateClickId: matchedClickId,
-      userId: matchedUserId,
-      merchantId: matchedMerchantId,
-      dealId: matchedDealId,
-      cashbackId: createdCashbackId,
-      campaignId: matchedCampaignId,
-      shareType: matchedShareType,
-      userShareValue: matchedShareValue,
-      orderAmount,
-      commissionAmount,
-      cashbackAmount: calculatedCashback,
-      currency: payload.currency || "INR",
-      status: effectiveStatus,
-      convertedAt: payload.convertedAt || new Date(),
-      rawPayload: payload.rawPayload ? (payload.rawPayload as Prisma.InputJsonValue) : Prisma.JsonNull,
-      campaignSnapshot: campaignSnapshot ? campaignSnapshot : Prisma.JsonNull,
-      reconciliationNotes,
-    },
   });
-
-  return {
-    conversionId: conversion.id,
-    provider: conversion.provider,
-    externalTransactionId: conversion.externalTransactionId,
-    status: conversion.status,
-    cashbackId: conversion.cashbackId,
-    cashbackAmount: conversion.cashbackAmount.toFixed(2),
-    isDuplicate: false,
-    isUnmatched: effectiveStatus === "UNMATCHED",
-  };
 }
 
 /**
@@ -471,13 +504,15 @@ export async function getAdminConversionById(id: string) {
           status: true,
           createdAt: true,
           confirmedAt: true,
-          walletTransaction: {
+          walletTransactions: {
             select: {
               id: true,
               amount: true,
               type: true,
               createdAt: true,
             },
+            take: 1,
+            orderBy: { createdAt: "desc" },
           },
         },
       },
@@ -488,6 +523,8 @@ export async function getAdminConversionById(id: string) {
     throw new ConversionServiceError("Conversion record not found", "NOT_FOUND", 404);
   }
 
+  const primaryTx = conversion.cashback?.walletTransactions?.[0] || null;
+
   return {
     ...conversion,
     orderAmount: conversion.orderAmount.toFixed(2),
@@ -497,12 +534,16 @@ export async function getAdminConversionById(id: string) {
       ? {
           ...conversion.cashback,
           amount: conversion.cashback.amount.toFixed(2),
-          walletTransaction: conversion.cashback.walletTransaction
+          walletTransaction: primaryTx
             ? {
-                ...conversion.cashback.walletTransaction,
-                amount: conversion.cashback.walletTransaction.amount.toFixed(2),
+                ...primaryTx,
+                amount: primaryTx.amount.toFixed(2),
               }
             : null,
+          walletTransactions: conversion.cashback.walletTransactions.map((tx) => ({
+            ...tx,
+            amount: tx.amount.toFixed(2),
+          })),
         }
       : null,
   };
@@ -589,128 +630,134 @@ export async function getAdminConversionsSummary(query: AdminConversionsSummaryQ
  * Links conversion to a valid click or user, recalculates cashback, and synchronizes the ledger.
  */
 export async function reconcileConversion(id: string, input: ReconcileConversionInput) {
-  const conversion = await prisma.conversion.findUnique({
-    where: { id },
-    include: {
-      cashback: true,
-    },
-  });
-
-  if (!conversion) {
-    throw new ConversionServiceError("Conversion record not found", "NOT_FOUND", 404);
-  }
-
-  let newClickId = conversion.affiliateClickId;
-  let newUserId = input.userId ?? conversion.userId;
-  let newMerchantId = input.merchantId ?? conversion.merchantId;
-  let newDealId = input.dealId ?? conversion.dealId;
-
-  if (input.clickId) {
-    const click = await prisma.affiliateClick.findUnique({
-      where: { clickId: input.clickId },
-    });
-
-    if (!click) {
-      throw new ConversionServiceError("Specified clickId was not found", "CLICK_NOT_FOUND", 404);
-    }
-
-    newClickId = click.id;
-    newUserId = click.userId ?? newUserId;
-    newMerchantId = click.merchantId ?? newMerchantId;
-    newDealId = click.dealId ?? newDealId;
-  }
-
-  // Recalculate cashback amount via Campaign Engine
-  let newCashbackAmount = conversion.cashbackAmount;
-  let matchedCampaignId = conversion.campaignId;
-  let matchedShareType = conversion.shareType;
-  let matchedShareValue = conversion.userShareValue;
-  let campaignSnapshot: Prisma.InputJsonValue | undefined =
-    conversion.campaignSnapshot === null ? undefined : (conversion.campaignSnapshot as Prisma.InputJsonValue);
-
-  if (newUserId) {
-    const calc = await calculateCashbackForConversion({
-      orderAmount: conversion.orderAmount,
-      dealId: newDealId,
-      merchantId: newMerchantId,
-      network: conversion.provider,
-      convertedAt: conversion.convertedAt,
-      userId: newUserId,
-    });
-
-    if (calc.isEligible && calc.campaign) {
-      newCashbackAmount = calc.cashbackAmount;
-      matchedCampaignId = calc.campaign.id;
-      matchedShareType = calc.campaign.shareType;
-      matchedShareValue = calc.campaign.userShareValue;
-      campaignSnapshot = calc.snapshot as unknown as Prisma.InputJsonValue;
-    } else if (!calc.campaign && conversion.commissionAmount.greaterThan(0)) {
-      newCashbackAmount = conversion.commissionAmount
-        .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
-        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
-    }
-  }
-
-  const targetStatus: ConversionStatus =
-    input.status ?? (conversion.status === "UNMATCHED" ? "PENDING" : conversion.status);
-
-  let cashbackId = conversion.cashbackId;
-
-  // If user is now attached and no cashback record exists, create one
-  if (newUserId && !cashbackId && newCashbackAmount.greaterThan(0)) {
-    const extRef = `${conversion.provider}_${conversion.externalTransactionId}`;
-    const cb = await prisma.cashback.create({
-      data: {
-        userId: newUserId,
-        merchantId: newMerchantId,
-        amount: newCashbackAmount,
-        status: "PENDING",
-        externalReferenceId: extRef,
-        description: `Reconciled cashback from ${conversion.provider} (${conversion.externalTransactionId})`,
+  return prisma.$transaction(async (tx) => {
+    const conversion = await tx.conversion.findUnique({
+      where: { id },
+      include: {
+        cashback: true,
       },
     });
-    cashbackId = cb.id;
 
-    if (targetStatus === "APPROVED") {
-      await updateCashbackStatus(cb.id, "APPROVED");
-    } else if (targetStatus === "CONFIRMED") {
-      await updateCashbackStatus(cb.id, "APPROVED");
-      await updateCashbackStatus(cb.id, "CONFIRMED");
+    if (!conversion) {
+      throw new ConversionServiceError("Conversion record not found", "NOT_FOUND", 404);
     }
-  }
 
-  const updatedNotes = input.notes
-    ? `${conversion.reconciliationNotes ? conversion.reconciliationNotes + " | " : ""}Reconciliation note: ${input.notes}`
-    : conversion.reconciliationNotes;
+    let newClickId = conversion.affiliateClickId;
+    let newUserId = input.userId ?? conversion.userId;
+    let newMerchantId = input.merchantId ?? conversion.merchantId;
+    let newDealId = input.dealId ?? conversion.dealId;
 
-  const updated = await prisma.conversion.update({
-    where: { id },
-    data: {
-      affiliateClickId: newClickId,
-      userId: newUserId,
-      merchantId: newMerchantId,
-      dealId: newDealId,
-      campaignId: matchedCampaignId,
-      shareType: matchedShareType,
-      userShareValue: matchedShareValue,
-      campaignSnapshot: campaignSnapshot ? (campaignSnapshot as Prisma.InputJsonValue) : Prisma.JsonNull,
-      cashbackId,
-      cashbackAmount: newCashbackAmount,
-      status: targetStatus,
-      reconciliationNotes: updatedNotes,
-    },
-    include: {
-      user: { select: { id: true, email: true, name: true } },
-      merchant: { select: { id: true, name: true } },
-      deal: { select: { id: true, title: true } },
-      cashback: true,
-    },
+    if (input.clickId) {
+      const click = await tx.affiliateClick.findUnique({
+        where: { clickId: input.clickId },
+      });
+
+      if (!click) {
+        throw new ConversionServiceError("Specified clickId was not found", "CLICK_NOT_FOUND", 404);
+      }
+
+      newClickId = click.id;
+      newUserId = click.userId ?? newUserId;
+      newMerchantId = click.merchantId ?? newMerchantId;
+      newDealId = click.dealId ?? newDealId;
+    }
+
+    // Recalculate cashback amount via Campaign Engine with row-locking
+    let newCashbackAmount = conversion.cashbackAmount;
+    let matchedCampaignId = conversion.campaignId;
+    let matchedShareType = conversion.shareType;
+    let matchedShareValue = conversion.userShareValue;
+    let campaignSnapshot: Prisma.InputJsonValue | undefined =
+      conversion.campaignSnapshot === null ? undefined : (conversion.campaignSnapshot as Prisma.InputJsonValue);
+
+    if (newUserId) {
+      const calc = await calculateCashbackForConversion({
+        orderAmount: conversion.orderAmount,
+        dealId: newDealId,
+        merchantId: newMerchantId,
+        network: conversion.provider,
+        convertedAt: conversion.convertedAt,
+        userId: newUserId,
+        tx,
+      });
+
+      if (calc.isEligible && calc.campaign) {
+        newCashbackAmount = calc.cashbackAmount;
+        matchedCampaignId = calc.campaign.id;
+        matchedShareType = calc.campaign.shareType;
+        matchedShareValue = calc.campaign.userShareValue;
+        campaignSnapshot = calc.snapshot as unknown as Prisma.InputJsonValue;
+      } else if (!calc.campaign && conversion.commissionAmount.greaterThan(0)) {
+        newCashbackAmount = conversion.commissionAmount
+          .mul(new Prisma.Decimal(PLATFORM_CASHBACK_PERCENT))
+          .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+      }
+    }
+
+    const targetStatus: ConversionStatus =
+      input.status ?? (conversion.status === "UNMATCHED" ? "PENDING" : conversion.status);
+
+    let cashbackId = conversion.cashbackId;
+
+    // If user is now attached and no cashback record exists, create one
+    if (newUserId && !cashbackId && newCashbackAmount.greaterThan(0)) {
+      const extRef = `${conversion.provider}_${conversion.externalTransactionId}`;
+      const cb = await tx.cashback.create({
+        data: {
+          userId: newUserId,
+          merchantId: newMerchantId,
+          amount: newCashbackAmount,
+          status: "PENDING",
+          externalReferenceId: extRef,
+          description: `Reconciled cashback from ${conversion.provider} (${conversion.externalTransactionId})`,
+        },
+      });
+      cashbackId = cb.id;
+
+      if (targetStatus === "APPROVED") {
+        await updateCashbackStatus(cb.id, "APPROVED", undefined, { tx });
+      } else if (targetStatus === "CONFIRMED") {
+        await updateCashbackStatus(cb.id, "APPROVED", undefined, { tx });
+        await updateCashbackStatus(cb.id, "CONFIRMED", undefined, {
+          provider: conversion.provider,
+          tx,
+        });
+      }
+    }
+
+    const updatedNotes = input.notes
+      ? `${conversion.reconciliationNotes ? conversion.reconciliationNotes + " | " : ""}Reconciliation note: ${input.notes}`
+      : conversion.reconciliationNotes;
+
+    const updated = await tx.conversion.update({
+      where: { id },
+      data: {
+        affiliateClickId: newClickId,
+        userId: newUserId,
+        merchantId: newMerchantId,
+        dealId: newDealId,
+        campaignId: matchedCampaignId,
+        shareType: matchedShareType,
+        userShareValue: matchedShareValue,
+        campaignSnapshot: campaignSnapshot ? (campaignSnapshot as Prisma.InputJsonValue) : Prisma.JsonNull,
+        cashbackId,
+        cashbackAmount: newCashbackAmount,
+        status: targetStatus,
+        reconciliationNotes: updatedNotes,
+      },
+      include: {
+        user: { select: { id: true, email: true, name: true } },
+        merchant: { select: { id: true, name: true } },
+        deal: { select: { id: true, title: true } },
+        cashback: true,
+      },
+    });
+
+    return {
+      ...updated,
+      orderAmount: updated.orderAmount.toFixed(2),
+      commissionAmount: updated.commissionAmount.toFixed(2),
+      cashbackAmount: updated.cashbackAmount.toFixed(2),
+    };
   });
-
-  return {
-    ...updated,
-    orderAmount: updated.orderAmount.toFixed(2),
-    commissionAmount: updated.commissionAmount.toFixed(2),
-    cashbackAmount: updated.cashbackAmount.toFixed(2),
-  };
 }

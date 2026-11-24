@@ -1,9 +1,11 @@
 import crypto from "crypto";
-import {
+import type {
   AffiliateNetworkAdapter,
   NormalizedConversionPayload,
   VerificationResult,
   WebhookHeaders,
+} from "./types";
+import {
   extractClickIdFromText,
   normalizeHeaders,
   getQueryParam,

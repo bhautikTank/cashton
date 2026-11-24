@@ -1,8 +1,10 @@
-import {
+import type {
   AffiliateNetworkAdapter,
   NormalizedConversionPayload,
   VerificationResult,
   WebhookHeaders,
+} from "./types";
+import {
   extractClickIdFromText,
   getQueryParam,
   parseFormEncoded,

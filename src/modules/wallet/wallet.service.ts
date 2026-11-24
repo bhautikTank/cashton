@@ -1,5 +1,7 @@
 import { prisma } from "@/src/lib/prisma";
-import { Prisma } from "@/src/generated/prisma/client";
+import { Prisma, WalletTransactionCategory, WalletTransactionType } from "@/src/generated/prisma/client";
+import { calculateHeldUntil } from "./hold-back.config";
+import { offsetDebtsWithCashback } from "./debt.service";
 
 export interface WalletSummaryResponse {
   totalTracked: string;
@@ -7,13 +9,15 @@ export interface WalletSummaryResponse {
   approvedCashback: string;
   confirmedCashback: string;
   availableBalance: string;
+  heldBalance: string;
+  debtBalance: string;
   totalPaidOut: string;
   currency: string;
   recentTransactions: Array<{
     id: string;
     amount: string;
-    type: "CREDIT" | "DEBIT" | "REVERSAL" | "ADJUSTMENT";
-    category: "CASHBACK" | "PAYOUT" | "ADMIN_ADJUSTMENT" | "BONUS";
+    type: WalletTransactionType;
+    category: WalletTransactionCategory;
     description: string;
     createdAt: Date;
   }>;
@@ -25,6 +29,9 @@ export async function getOrCreateWallet(userId: string) {
     create: {
       userId,
       balance: new Prisma.Decimal("0.00"),
+      availableBalance: new Prisma.Decimal("0.00"),
+      heldBalance: new Prisma.Decimal("0.00"),
+      debtBalance: new Prisma.Decimal("0.00"),
     },
     update: {},
   });
@@ -34,7 +41,8 @@ export async function getOrCreateWallet(userId: string) {
  * Calculates a complete financial cashback summary for the user.
  * Avoids double-counting:
  * - Cashback lifecycle totals (Pending, Approved, Confirmed) are computed strictly from Cashback records.
- * - Available balance is calculated from the append-only WalletTransaction ledger (Credits - Debits).
+ * - Available, held, and debt balances are derived directly from the Wallet model projections
+ *   and verified against the append-only WalletTransaction ledger.
  * - Total Paid Out is calculated from Payout debits.
  * - Rejected and reversed cashbacks are excluded from earned totals.
  */
@@ -50,8 +58,6 @@ export async function getWalletSummary(
     confirmedAgg,
     trackedAgg,
     payoutAgg,
-    ledgerCreditsAgg,
-    ledgerDebitsAgg,
     recentTransactions,
   ] = await Promise.all([
     // Pending cashback
@@ -86,22 +92,6 @@ export async function getWalletSummary(
       },
       _sum: { amount: true },
     }),
-    // Ledger total credits
-    prisma.walletTransaction.aggregate({
-      where: {
-        walletId: wallet.id,
-        type: { in: ["CREDIT", "ADJUSTMENT"] },
-      },
-      _sum: { amount: true },
-    }),
-    // Ledger total debits
-    prisma.walletTransaction.aggregate({
-      where: {
-        walletId: wallet.id,
-        type: { in: ["DEBIT", "REVERSAL"] },
-      },
-      _sum: { amount: true },
-    }),
     // Recent ledger transactions
     prisma.walletTransaction.findMany({
       where: { walletId: wallet.id },
@@ -118,14 +108,9 @@ export async function getWalletSummary(
   const totalTracked = trackedAgg._sum.amount ?? zero;
   const totalPaidOut = payoutAgg._sum.amount ?? zero;
 
-  const totalCredits = ledgerCreditsAgg._sum.amount ?? zero;
-  const totalDebits = ledgerDebitsAgg._sum.amount ?? zero;
-
-  // Ledger is source of truth for available balance
-  const ledgerAvailableBalance = totalCredits.sub(totalDebits);
-  const availableBalance = ledgerAvailableBalance.greaterThan(zero)
-    ? ledgerAvailableBalance
-    : zero;
+  const availableBalance = wallet.availableBalance ?? zero;
+  const heldBalance = wallet.heldBalance ?? zero;
+  const debtBalance = wallet.debtBalance ?? zero;
 
   return {
     totalTracked: totalTracked.toFixed(2),
@@ -133,6 +118,8 @@ export async function getWalletSummary(
     approvedCashback: approved.toFixed(2),
     confirmedCashback: confirmed.toFixed(2),
     availableBalance: availableBalance.toFixed(2),
+    heldBalance: heldBalance.toFixed(2),
+    debtBalance: debtBalance.toFixed(2),
     totalPaidOut: totalPaidOut.toFixed(2),
     currency: "INR",
     recentTransactions: recentTransactions.map((tx) => ({
@@ -148,54 +135,146 @@ export async function getWalletSummary(
 
 /**
  * Credits confirmed cashback to a user's wallet inside a database transaction.
- * Ensures strict idempotency via unique cashbackId on WalletTransaction.
+ * 1. Checks and auto-offsets any open un-disputed debts (oldest first).
+ * 2. Credits any remaining un-offset amount to heldBalance with configurable hold window.
+ * 3. Updates Cashback record with heldAmount, heldUntil, and holdReleased.
  */
 export async function creditCashbackToWallet(params: {
   userId: string;
   cashbackId: string;
   amount: Prisma.Decimal | number | string;
   description: string;
+  provider?: string | null;
   idempotencyKey?: string;
+  tx?: Prisma.TransactionClient;
 }) {
   const decimalAmount = new Prisma.Decimal(params.amount);
   if (decimalAmount.lessThanOrEqualTo(0)) {
     throw new Error("Credit amount must be greater than zero");
   }
 
-  return prisma.$transaction(async (tx) => {
+  const executeInTx = async (tx: Prisma.TransactionClient) => {
+    // 1. Ensure wallet exists
     const wallet = await tx.wallet.upsert({
       where: { userId: params.userId },
       create: {
         userId: params.userId,
-        balance: decimalAmount,
+        balance: new Prisma.Decimal("0.00"),
+        availableBalance: new Prisma.Decimal("0.00"),
+        heldBalance: new Prisma.Decimal("0.00"),
+        debtBalance: new Prisma.Decimal("0.00"),
       },
-      update: {
-        balance: { increment: decimalAmount },
-      },
+      update: {},
     });
 
-    const transaction = await tx.walletTransaction.create({
-      data: {
-        walletId: wallet.id,
-        amount: decimalAmount,
-        type: "CREDIT",
-        category: "CASHBACK",
-        cashbackId: params.cashbackId,
-        idempotencyKey: params.idempotencyKey ?? `cashback-${params.cashbackId}`,
-        description: params.description,
-      },
-    });
+    // Acquire exclusive row lock on this wallet to serialize concurrent confirmations & debt offsets
+    await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${wallet.id} FOR UPDATE`;
 
-    await tx.cashback.update({
+    // Proactively check if cashback confirmation was already processed across all outcome branches:
+    // Branch 1: Cashback was already marked CONFIRMED
+    // Branch 2: Cashback was already processed (either 100% debt offset or credited to hold)
+    const existingCashback = await tx.cashback.findUnique({
       where: { id: params.cashbackId },
-      data: {
-        status: "CONFIRMED",
-        confirmedAt: new Date(),
+      select: { status: true },
+    });
+    if (existingCashback?.status === "CONFIRMED") {
+      return {
+        walletId: wallet.id,
+        totalCredit: "0.00",
+        debtOffset: "0.00",
+        creditedToHold: "0.00",
+        isDuplicate: true,
+        transaction: null,
+      };
+    }
+
+    const existingTx = await tx.walletTransaction.findFirst({
+      where: {
+        walletId: wallet.id,
+        cashbackId: params.cashbackId,
       },
     });
+    if (existingTx) {
+      return {
+        walletId: wallet.id,
+        totalCredit: "0.00",
+        debtOffset: "0.00",
+        creditedToHold: "0.00",
+        isDuplicate: true,
+        transaction: existingTx,
+      };
+    }
 
-    return transaction;
-  });
+    // 2. Auto-offset any open debts (oldest first)
+    const { totalOffset, remainderForHold } = await offsetDebtsWithCashback(tx, {
+      userId: params.userId,
+      cashbackId: params.cashbackId,
+      amount: decimalAmount,
+    });
+
+    let transaction = null;
+
+    // 3. If there is remaining cashback after debt offset, credit to heldBalance
+    if (remainderForHold.greaterThan(0)) {
+      const heldUntil = calculateHeldUntil(params.provider);
+
+      await tx.wallet.update({
+        where: { id: wallet.id },
+        data: {
+          heldBalance: { increment: remainderForHold },
+          balance: { increment: remainderForHold },
+        },
+      });
+
+      transaction = await tx.walletTransaction.create({
+        data: {
+          walletId: wallet.id,
+          amount: remainderForHold,
+          type: "CREDIT",
+          category: "CASHBACK",
+          cashbackId: params.cashbackId,
+          idempotencyKey: params.idempotencyKey ?? `cashback-${params.cashbackId}`,
+          description: params.description,
+        },
+      });
+
+      await tx.cashback.update({
+        where: { id: params.cashbackId },
+        data: {
+          heldAmount: remainderForHold,
+          heldUntil,
+          holdReleased: false,
+          status: "CONFIRMED",
+          confirmedAt: new Date(),
+        },
+      });
+    } else {
+      // Entire cashback was offset against existing debt
+      await tx.cashback.update({
+        where: { id: params.cashbackId },
+        data: {
+          heldAmount: new Prisma.Decimal("0.00"),
+          heldUntil: new Date(),
+          holdReleased: true,
+          status: "CONFIRMED",
+          confirmedAt: new Date(),
+        },
+      });
+    }
+
+    return {
+      walletId: wallet.id,
+      totalCredit: decimalAmount.toFixed(2),
+      debtOffset: totalOffset.toFixed(2),
+      creditedToHold: remainderForHold.toFixed(2),
+      transaction,
+    };
+  };
+
+  if (params.tx) {
+    return executeInTx(params.tx);
+  }
+  return prisma.$transaction(executeInTx);
 }
 
 /**
@@ -208,13 +287,14 @@ export async function debitWallet(params: {
   category: "PAYOUT" | "ADMIN_ADJUSTMENT";
   description: string;
   idempotencyKey?: string;
+  tx?: Prisma.TransactionClient;
 }) {
   const decimalAmount = new Prisma.Decimal(params.amount);
   if (decimalAmount.lessThanOrEqualTo(0)) {
     throw new Error("Debit amount must be greater than zero");
   }
 
-  return prisma.$transaction(async (tx) => {
+  const executeInTx = async (tx: Prisma.TransactionClient) => {
     const wallet = await tx.wallet.findUnique({
       where: { userId: params.userId },
     });
@@ -223,24 +303,41 @@ export async function debitWallet(params: {
       throw new Error("Wallet not found");
     }
 
-    // Atomic decrement with condition to prevent race conditions and negative balances
-    const updateResult = await tx.wallet.updateMany({
-      where: {
-        id: wallet.id,
-        balance: { gte: decimalAmount },
-      },
+    // Acquire exclusive row lock on wallet to serialize concurrent debits and prevent overdrafts
+    await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${wallet.id} FOR UPDATE`;
+
+    const lockedWallet = await tx.wallet.findUniqueOrThrow({
+      where: { id: wallet.id },
+    });
+
+    // Upfront idempotency check: if transaction with this idempotencyKey already exists, return it
+    if (params.idempotencyKey) {
+      const existingTx = await tx.walletTransaction.findFirst({
+        where: {
+          walletId: lockedWallet.id,
+          idempotencyKey: params.idempotencyKey,
+        },
+      });
+      if (existingTx) {
+        return existingTx;
+      }
+    }
+
+    if (lockedWallet.availableBalance.lessThan(decimalAmount)) {
+      throw new Error("Insufficient withdrawable balance for this transaction");
+    }
+
+    await tx.wallet.update({
+      where: { id: lockedWallet.id },
       data: {
+        availableBalance: { decrement: decimalAmount },
         balance: { decrement: decimalAmount },
       },
     });
 
-    if (updateResult.count === 0) {
-      throw new Error("Insufficient wallet balance for this transaction");
-    }
-
     const transaction = await tx.walletTransaction.create({
       data: {
-        walletId: wallet.id,
+        walletId: lockedWallet.id,
         amount: decimalAmount,
         type: "DEBIT",
         category: params.category,
@@ -250,5 +347,10 @@ export async function debitWallet(params: {
     });
 
     return transaction;
-  });
+  };
+
+  if (params.tx) {
+    return executeInTx(params.tx);
+  }
+  return prisma.$transaction(executeInTx);
 }

@@ -1,5 +1,5 @@
 import { AffiliateProvider } from "@/src/generated/prisma/client";
-import { AffiliateNetworkAdapter } from "./types";
+import type { AffiliateNetworkAdapter } from "./types";
 import { CuelinksAdapter } from "./cuelinks.adapter";
 import { AdmitadAdapter } from "./admitad.adapter";
 import { GenericAdapter } from "./generic.adapter";
