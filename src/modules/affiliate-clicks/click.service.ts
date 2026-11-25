@@ -42,12 +42,16 @@ export function isSafeRedirectUrl(urlStr: string): boolean {
     }
 
     const parsed = new URL(trimmed);
-    // Enforce protocol strictly
+    // Enforce protocol strictly and disallow embedded userinfo credentials
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return false;
     }
+    if (parsed.username || parsed.password) {
+      return false;
+    }
 
-    const hostname = parsed.hostname.toLowerCase();
+    // Strip trailing FQDN dot(s) so `localhost.` or `127.0.0.1.` cannot bypass hostname/IP checks
+    const hostname = parsed.hostname.toLowerCase().replace(/\.+$/, "");
     // Hostname validation
     if (!hostname || hostname.length < 3 || !hostname.includes(".")) {
       return false;

@@ -448,7 +448,23 @@ export async function createWithdrawalRequest(params: {
       };
     }, INTERACTIVE_TX_OPTIONS);
   } catch (err: unknown) {
-    // If concurrent race hits unique constraint on Payout.idempotencyKey, resolve safely
+    // Handle concurrent race hitting unique constraint on Payout.idempotencyKey or WalletTransaction.idempotencyKey
+    if (err instanceof Error) {
+      if (err.message === "Transaction idempotency key belongs to another wallet") {
+        throw new PayoutServiceError(
+          "Idempotency key already used by another account",
+          "IDEMPOTENCY_KEY_COLLISION",
+          409
+        );
+      }
+      if (err.message === "Transaction idempotency key payload mismatch") {
+        throw new PayoutServiceError(
+          "Idempotency key already used with a different withdrawal amount",
+          "IDEMPOTENCY_PAYLOAD_MISMATCH",
+          409
+        );
+      }
+    }
     if (
       err instanceof Prisma.PrismaClientKnownRequestError &&
       err.code === "P2002"

@@ -46,16 +46,14 @@ export class CuelinksAdapter implements AffiliateNetworkAdapter {
     _rawBody: string,
     queryParams?: Record<string, string> | URLSearchParams
   ): VerificationResult {
-    const expectedSecret = process.env.CUELINKS_POSTBACK_SECRET;
+    const expectedSecret =
+      process.env.CUELINKS_POSTBACK_SECRET || process.env.CUELINKS_WEBHOOK_SECRET;
 
     if (!expectedSecret) {
-      if (process.env.NODE_ENV === "production") {
-        return {
-          valid: false,
-          error: "CUELINKS_POSTBACK_SECRET is not configured in production environment",
-        };
-      }
-      return { valid: true };
+      return {
+        valid: false,
+        error: "CUELINKS_POSTBACK_SECRET / CUELINKS_WEBHOOK_SECRET is not configured",
+      };
     }
 
     const providedSecret =

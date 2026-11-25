@@ -1,4 +1,5 @@
 import { prisma } from "@/src/lib/prisma";
+import { isSafeRedirectUrl } from "@/src/modules/affiliate-clicks/click.service";
 import type {
   CreateDealInput,
   UpdateDealInput,
@@ -228,6 +229,14 @@ export async function createDeal(input: CreateDealInput): Promise<Deal> {
     throw new DealServiceError("Merchant not found", "MERCHANT_NOT_FOUND", 404);
   }
 
+  if (input.affiliateUrl && !isSafeRedirectUrl(input.affiliateUrl)) {
+    throw new DealServiceError(
+      "Deal affiliate URL is invalid or unsafe",
+      "INVALID_DESTINATION",
+      400
+    );
+  }
+
   const deal = await prisma.deal.create({
     data: {
       merchantId: input.merchantId,
@@ -328,7 +337,16 @@ export async function updateDeal(
   if (input.imageUrl !== undefined) data.imageUrl = input.imageUrl;
   if (input.originalPrice !== undefined) data.originalPrice = input.originalPrice;
   if (input.dealPrice !== undefined) data.dealPrice = input.dealPrice;
-  if (input.affiliateUrl !== undefined) data.affiliateUrl = input.affiliateUrl;
+  if (input.affiliateUrl !== undefined) {
+    if (input.affiliateUrl && !isSafeRedirectUrl(input.affiliateUrl)) {
+      throw new DealServiceError(
+        "Deal affiliate URL is invalid or unsafe",
+        "INVALID_DESTINATION",
+        400
+      );
+    }
+    data.affiliateUrl = input.affiliateUrl;
+  }
   if (input.startDate !== undefined) data.startDate = input.startDate;
   if (input.endDate !== undefined) data.endDate = input.endDate;
   if (input.isActive !== undefined) data.isActive = input.isActive;

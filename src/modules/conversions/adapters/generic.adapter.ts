@@ -44,33 +44,25 @@ export class GenericAdapter implements AffiliateNetworkAdapter {
       getQueryParam(queryParams, "token") ||
       getQueryParam(queryParams, "secret");
 
-    if (expectedSecret) {
-      if (signature) {
-        const computedHmac = crypto
-          .createHmac("sha256", expectedSecret)
-          .update(rawBody || "")
-          .digest("hex");
-        if (safeEqual(signature, computedHmac)) {
-          return { valid: true };
-        }
-      }
-
-      if (token && safeEqual(token, expectedSecret)) {
-        return { valid: true };
-      }
-
-      return { valid: false, error: "Invalid webhook signature or token" };
+    if (!expectedSecret) {
+      return { valid: false, error: "GENERIC_WEBHOOK_SECRET is not configured" };
     }
 
-    if (token || signature) {
+    if (signature) {
+      const computedHmac = crypto
+        .createHmac("sha256", expectedSecret)
+        .update(rawBody || "")
+        .digest("hex");
+      if (safeEqual(signature, computedHmac)) {
+        return { valid: true };
+      }
+    }
+
+    if (token && safeEqual(token, expectedSecret)) {
       return { valid: true };
     }
 
-    if (process.env.NODE_ENV === "production") {
-      return { valid: false, error: "GENERIC_WEBHOOK_SECRET is not configured in production" };
-    }
-
-    return { valid: true };
+    return { valid: false, error: "Invalid webhook signature or token" };
   }
 
   extractClickId(

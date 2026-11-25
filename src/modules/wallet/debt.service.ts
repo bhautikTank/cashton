@@ -1,4 +1,4 @@
-import { prisma } from "@/src/lib/prisma";
+import { prisma, INTERACTIVE_TX_OPTIONS } from "@/src/lib/prisma";
 import { Prisma, CashbackDebtStatus } from "@/src/generated/prisma/client";
 import type { ListDebtsQueryInput, ResolveDebtInput } from "@/src/lib/validations/debt.schema";
 
@@ -152,7 +152,7 @@ export async function disputeDebt(debtId: string, userId: string, reason: string
       remainingAmount: updated.remainingAmount.toFixed(2),
       reason: updated.reason,
     };
-  });
+  }, INTERACTIVE_TX_OPTIONS);
 }
 
 /**
@@ -164,6 +164,19 @@ export async function resolveDebt(
   input: ResolveDebtInput
 ) {
   return prisma.$transaction(async (tx) => {
+    const initialDebt = await tx.cashbackDebt.findUnique({
+      where: { id: debtId },
+      select: { walletId: true },
+    });
+
+    if (!initialDebt) {
+      throw new Error("Debt record not found");
+    }
+
+    // Lock the Wallet row first (matching offsetDebtsWithCashback / executeMultiStageReversal lock order)
+    // so concurrent automatic cashback offsets cannot double-decrement debtBalance.
+    await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${initialDebt.walletId} FOR UPDATE`;
+
     const debt = await tx.cashbackDebt.findUnique({
       where: { id: debtId },
     });
@@ -303,7 +316,7 @@ export async function resolveDebt(
     }
 
     throw new Error(`Unsupported debt resolution action: ${input.action}`);
-  });
+  }, INTERACTIVE_TX_OPTIONS);
 }
 
 /**

@@ -45,16 +45,14 @@ export class AdmitadAdapter implements AffiliateNetworkAdapter {
     _rawBody: string,
     queryParams?: Record<string, string> | URLSearchParams
   ): VerificationResult {
-    const expectedSecret = process.env.ADMITAD_POSTBACK_SECRET;
+    const expectedSecret =
+      process.env.ADMITAD_POSTBACK_SECRET || process.env.ADMITAD_WEBHOOK_SECRET;
 
     if (!expectedSecret) {
-      if (process.env.NODE_ENV === "production") {
-        return {
-          valid: false,
-          error: "ADMITAD_POSTBACK_SECRET is not configured in production environment",
-        };
-      }
-      return { valid: true };
+      return {
+        valid: false,
+        error: "ADMITAD_POSTBACK_SECRET / ADMITAD_WEBHOOK_SECRET is not configured",
+      };
     }
 
     const providedSecret =
