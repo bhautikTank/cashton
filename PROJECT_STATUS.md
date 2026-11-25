@@ -432,6 +432,10 @@ Last Updated: 2026-11-19
 - **Automated Payout Disbursements**: While confirmed cashback credits the wallet, actual bank payout processing, withdrawal request approvals, and payment gateway transfers are owned by Phase 8.
 - **Frontend Campaign & Conversion Views**: Campaign management and detailed conversion analytics are fully operational via Admin APIs and User Wallet Summaries; dedicated administrative UI tables will be completed in Phase 11.
 
+### Accepted & Documented Platform Limitations (Not Pending Fixes)
+- **Supabase Auth Leaked Password Protection (`auth_leaked_password_protection`) — ACCEPTED (Plan Limitation):** HaveIBeenPwned leaked-password checking in Supabase Auth requires the **Supabase Pro plan or above** and is unavailable on the Free plan. Treat this as an accepted tier limitation, not a pending fix, and do not re-flag in audits unless the project upgrades to a paid Supabase plan.
+- **In-Memory Affiliate Click Rate Limiter (`src/modules/affiliate-clicks/rate-limiter.ts`) — KNOWN SCALING LIMITATION:** Uses a process-local `Map` (`60 req / 60s`), which resets on server restart/redeploy and does not coordinate across multiple serverless/horizontal instances. Replace with shared storage (e.g., Upstash Redis / WAF rate limit) when scaling across multiple instances.
+
 ---
 
 ## 10. Recommended Next Phase

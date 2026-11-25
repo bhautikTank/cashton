@@ -35,3 +35,7 @@ Before the final response, run one reporting pass. If candidates remain, from th
   1. Run `ALTER TABLE "public"."<NewTable>" ENABLE ROW LEVEL SECURITY;`
   2. Revoke `anon` and `authenticated` table privileges (guarded by `pg_roles` check for local/CI Postgres portability)
   3. Attach the deny-all `RESTRICTIVE` policy `TO anon, authenticated USING (false) WITH CHECK (false)` unless PostgREST access is explicitly intended and audited.
+
+## Accepted Platform Limitations (Audit Policy)
+
+- **Supabase Auth `auth_leaked_password_protection`:** Accepted limitation on the Supabase Free plan (feature requires Supabase Pro plan or above). Do not re-flag this advisor warning as an open gap or pending fix unless the project is on a paid Supabase plan.
