@@ -28,3 +28,10 @@ Retain qualifying friction even if it is later fixed or worked around; record th
 Before the final response, run one reporting pass. If candidates remain, from this file's directory run `npx --no-install next internal agent-feedback-instructions` once without piping or truncating its output. Follow its output or error guidance. If a network sandbox blocks it, retry with network access; if it still returns no output, continue normally.
 
 <!-- END:nextjs-agent-feedback -->
+
+## Database Migration Checklist (Standing Security Requirement)
+
+- Every future Prisma migration that creates any new table in schema `public` **must** explicitly:
+  1. Run `ALTER TABLE "public"."<NewTable>" ENABLE ROW LEVEL SECURITY;`
+  2. Revoke `anon` and `authenticated` table privileges (guarded by `pg_roles` check for local/CI Postgres portability)
+  3. Attach the deny-all `RESTRICTIVE` policy `TO anon, authenticated USING (false) WITH CHECK (false)` unless PostgREST access is explicitly intended and audited.
