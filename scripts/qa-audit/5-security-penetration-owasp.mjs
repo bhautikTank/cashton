@@ -165,6 +165,10 @@ export async function runSecurityPenetrationTests() {
     { method: "POST", path: "/api/admin/coupons" },
     { method: "GET", path: "/api/admin/affiliate-clicks" },
     { method: "GET", path: "/api/admin/affiliate-clicks/summary" },
+    { method: "GET", path: "/api/admin/payouts" },
+    { method: "POST", path: "/api/admin/payouts/00000000-0000-0000-0000-000000000000/approve" },
+    { method: "POST", path: "/api/admin/payouts/00000000-0000-0000-0000-000000000000/complete" },
+    { method: "POST", path: "/api/admin/payouts/00000000-0000-0000-0000-000000000000/reject" },
   ];
 
   for (const r of adminRoutes) {

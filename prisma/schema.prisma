@@ -23,6 +23,14 @@ enum PayoutMethod {
   UPI
 }
 
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+  REJECTED
+}
+
 enum PayoutVerificationStatus {
   PENDING
   VERIFIED
@@ -67,6 +75,7 @@ enum WalletTransactionCategory {
   DEBT_CREATED
   DEBT_RECOVERED
   DEBT_WRITTEN_OFF
+  PAYOUT_REFUND
 }
 
 enum CashbackDebtStatus {
@@ -119,6 +128,8 @@ model User {
   conversions     Conversion[]
   debts           CashbackDebt[]   @relation("UserDebts")
   resolvedDebts   CashbackDebt[]   @relation("AdminDebtResolutions")
+  payouts         Payout[]
+  processedPayouts Payout[]        @relation("AdminPayoutProcessing")
 }
 
 model Merchant {
@@ -210,6 +221,7 @@ model Wallet {
 
   transactions     WalletTransaction[]
   debts            CashbackDebt[]
+  payouts          Payout[]
 
   @@index([userId])
 }
@@ -227,6 +239,8 @@ model WalletTransaction {
   cashback       Cashback?                 @relation(fields: [cashbackId], references: [id], onDelete: SetNull)
   debtId         String?
   debt           CashbackDebt?             @relation(fields: [debtId], references: [id], onDelete: SetNull)
+  payoutId       String?
+  payout         Payout?                   @relation(fields: [payoutId], references: [id], onDelete: Restrict)
 
   createdAt      DateTime                  @default(now())
 
@@ -234,6 +248,7 @@ model WalletTransaction {
   @@index([createdAt])
   @@index([cashbackId])
   @@index([debtId])
+  @@index([payoutId])
 }
 
 model Deal {
@@ -426,4 +441,32 @@ model CashbackDebt {
   @@index([userId])
   @@index([status])
   @@index([resolvedByAdminId])
+}
+
+model Payout {
+  id                 String        @id @default(uuid())
+  userId             String
+  user               User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  walletId           String
+  wallet             Wallet        @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  amount             Decimal       @db.Decimal(10, 2)
+  status             PayoutStatus  @default(PENDING)
+  payoutMethod       PayoutMethod  @default(UPI)
+  destinationMasked  String?
+  provider           String        @default("MANUAL")
+  providerReference  String?
+  idempotencyKey     String?       @unique
+  failureReason      String?
+  processedByAdminId String?
+  processedByAdmin   User?         @relation("AdminPayoutProcessing", fields: [processedByAdminId], references: [id], onDelete: Restrict)
+  processedAt        DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  transactions       WalletTransaction[]
+
+  @@index([userId, status])
+  @@index([status])
+  @@index([createdAt])
+  @@index([processedByAdminId])
 }

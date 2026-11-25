@@ -4,6 +4,7 @@ import { payoutDetailsSchema } from "@/src/lib/validations/payout.schema";
 import {
   getPayoutDetails,
   savePayoutDetails,
+  PayoutServiceError,
 } from "@/src/modules/payout/payout.service";
 
 export async function GET() {
@@ -81,6 +82,13 @@ export async function POST(request: Request) {
       digest?.includes("PRERENDER")
     ) {
       throw error;
+    }
+
+    if (error instanceof PayoutServiceError) {
+      return NextResponse.json(
+        { success: false, code: error.code, message: error.message },
+        { status: error.statusCode }
+      );
     }
 
     console.error("Save payout details error:", error instanceof Error ? error.message : "Internal error");

@@ -1,4 +1,4 @@
-import { prisma } from "@/src/lib/prisma";
+import { prisma, INTERACTIVE_TX_OPTIONS } from "@/src/lib/prisma";
 import { Prisma, CashbackStatus } from "@/src/generated/prisma/client";
 import { creditCashbackToWallet } from "@/src/modules/wallet/wallet.service";
 import { executeMultiStageReversal } from "@/src/modules/wallet/debt.service";
@@ -134,7 +134,7 @@ export async function updateCashbackStatus(
       return tx.cashback.findUnique({
         where: { id: cashbackId },
       });
-    });
+    }, INTERACTIVE_TX_OPTIONS);
   }
 
   return db.cashback.update({

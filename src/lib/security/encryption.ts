@@ -77,6 +77,15 @@ export function decryptSensitive(ciphertext: string): string {
   }
 
   const [ivHex, authTagHex, encryptedHex] = parts;
+  if (
+    !/^[0-9a-fA-F]{32}$/.test(ivHex) ||
+    !/^[0-9a-fA-F]{32}$/.test(authTagHex) ||
+    !/^[0-9a-fA-F]+$/.test(encryptedHex) ||
+    encryptedHex.length % 2 !== 0
+  ) {
+    throw new Error("Invalid encrypted payload encoding");
+  }
+
   const iv = Buffer.from(ivHex, "hex");
   const authTag = Buffer.from(authTagHex, "hex");
 
@@ -109,8 +118,11 @@ export function maskAccountNumber(accountNumberOrLast4: string | null | undefine
 export function maskUpiId(upiId: string | null | undefined): string | null {
   if (!upiId) return null;
   const clean = upiId.trim();
+  if (clean.split(":").length === 3) {
+    return "[ENCRYPTED]";
+  }
   const parts = clean.split("@");
-  if (parts.length !== 2) return clean;
+  if (parts.length !== 2) return "••••";
   const [handle, provider] = parts;
   if (handle.length <= 4) {
     return `${handle[0]}••••@${provider}`;

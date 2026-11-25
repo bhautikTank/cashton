@@ -1,4 +1,4 @@
-import { prisma } from "@/src/lib/prisma";
+import { prisma, INTERACTIVE_TX_OPTIONS } from "@/src/lib/prisma";
 import { Prisma, WalletTransactionCategory, WalletTransactionType } from "@/src/generated/prisma/client";
 import { calculateHeldUntil } from "./hold-back.config";
 import { offsetDebtsWithCashback } from "./debt.service";
@@ -57,7 +57,8 @@ export async function getWalletSummary(
     approvedAgg,
     confirmedAgg,
     trackedAgg,
-    payoutAgg,
+    paidPayoutAgg,
+    legacyPayoutAgg,
     recentTransactions,
   ] = await Promise.all([
     // Pending cashback
@@ -83,12 +84,21 @@ export async function getWalletSummary(
       },
       _sum: { amount: true },
     }),
-    // Total Paid Out from Wallet
+    // Paid payouts (Phase 8 Payout records that reached terminal PAID state)
+    prisma.payout.aggregate({
+      where: {
+        userId,
+        status: "PAID",
+      },
+      _sum: { amount: true },
+    }),
+    // Legacy direct PAYOUT debits not linked to a Payout record
     prisma.walletTransaction.aggregate({
       where: {
         walletId: wallet.id,
         category: "PAYOUT",
         type: "DEBIT",
+        payoutId: null,
       },
       _sum: { amount: true },
     }),
@@ -106,7 +116,9 @@ export async function getWalletSummary(
   const approved = approvedAgg._sum.amount ?? zero;
   const confirmed = confirmedAgg._sum.amount ?? zero;
   const totalTracked = trackedAgg._sum.amount ?? zero;
-  const totalPaidOut = payoutAgg._sum.amount ?? zero;
+  const paidPayoutTotal = paidPayoutAgg._sum.amount ?? zero;
+  const legacyPaidOut = legacyPayoutAgg._sum.amount ?? zero;
+  const totalPaidOut = paidPayoutTotal.plus(legacyPaidOut);
 
   const availableBalance = wallet.availableBalance ?? zero;
   const heldBalance = wallet.heldBalance ?? zero;
@@ -149,8 +161,8 @@ export async function creditCashbackToWallet(params: {
   tx?: Prisma.TransactionClient;
 }) {
   const decimalAmount = new Prisma.Decimal(params.amount);
-  if (decimalAmount.lessThanOrEqualTo(0)) {
-    throw new Error("Credit amount must be greater than zero");
+  if (!decimalAmount.isFinite() || decimalAmount.lessThanOrEqualTo(0)) {
+    throw new Error("Credit amount must be a finite number greater than zero");
   }
 
   const executeInTx = async (tx: Prisma.TransactionClient) => {
@@ -274,7 +286,7 @@ export async function creditCashbackToWallet(params: {
   if (params.tx) {
     return executeInTx(params.tx);
   }
-  return prisma.$transaction(executeInTx);
+  return prisma.$transaction(executeInTx, INTERACTIVE_TX_OPTIONS);
 }
 
 /**
@@ -290,8 +302,8 @@ export async function debitWallet(params: {
   tx?: Prisma.TransactionClient;
 }) {
   const decimalAmount = new Prisma.Decimal(params.amount);
-  if (decimalAmount.lessThanOrEqualTo(0)) {
-    throw new Error("Debit amount must be greater than zero");
+  if (!decimalAmount.isFinite() || decimalAmount.lessThanOrEqualTo(0)) {
+    throw new Error("Debit amount must be a finite number greater than zero");
   }
 
   const executeInTx = async (tx: Prisma.TransactionClient) => {
@@ -310,15 +322,21 @@ export async function debitWallet(params: {
       where: { id: wallet.id },
     });
 
-    // Upfront idempotency check: if transaction with this idempotencyKey already exists, return it
+    // Upfront idempotency check against globally unique idempotencyKey
     if (params.idempotencyKey) {
-      const existingTx = await tx.walletTransaction.findFirst({
-        where: {
-          walletId: lockedWallet.id,
-          idempotencyKey: params.idempotencyKey,
-        },
+      const existingTx = await tx.walletTransaction.findUnique({
+        where: { idempotencyKey: params.idempotencyKey },
       });
       if (existingTx) {
+        if (existingTx.walletId !== lockedWallet.id) {
+          throw new Error("Transaction idempotency key belongs to another wallet");
+        }
+        if (
+          !existingTx.amount.equals(decimalAmount) ||
+          existingTx.category !== params.category
+        ) {
+          throw new Error("Transaction idempotency key payload mismatch");
+        }
         return existingTx;
       }
     }
@@ -352,5 +370,5 @@ export async function debitWallet(params: {
   if (params.tx) {
     return executeInTx(params.tx);
   }
-  return prisma.$transaction(executeInTx);
+  return prisma.$transaction(executeInTx, INTERACTIVE_TX_OPTIONS);
 }

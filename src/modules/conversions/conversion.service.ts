@@ -1,4 +1,4 @@
-import { prisma } from "@/src/lib/prisma";
+import { prisma, INTERACTIVE_TX_OPTIONS } from "@/src/lib/prisma";
 import {
   Prisma,
   AffiliateProvider,
@@ -309,7 +309,7 @@ export async function ingestNormalizedConversion(
       isDuplicate: false,
       isUnmatched: effectiveStatus === "UNMATCHED",
     };
-  });
+  }, INTERACTIVE_TX_OPTIONS);
 }
 
 /**
@@ -759,5 +759,5 @@ export async function reconcileConversion(id: string, input: ReconcileConversion
       commissionAmount: updated.commissionAmount.toFixed(2),
       cashbackAmount: updated.cashbackAmount.toFixed(2),
     };
-  });
+  }, INTERACTIVE_TX_OPTIONS);
 }

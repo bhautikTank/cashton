@@ -1,6 +1,6 @@
 /**
  * MASTER QA & SECURITY AUDIT TEST RUNNER
- * Orchestrates all 7 automated audit suites across testing disciplines:
+ * Orchestrates all 8 automated audit suites across testing disciplines:
  * - Discipline 1: Unit & Pure Logic Testing
  * - Discipline 2: Integration & Contract Testing
  * - Discipline 3: State-Transition & Workflow Testing
@@ -8,6 +8,7 @@
  * - Discipline 5: Security & Penetration Testing (OWASP API Top 10)
  * - Discipline 6: Database Integrity, Constraint & Transaction Atomicity
  * - Discipline 7: Chaos, Resilience & Edge-Case Testing
+ * - Discipline 8: Withdrawal & Payout Engine Testing (Phase 8)
  */
 
 import { runUnitLogicTests } from "./1-unit-pure-logic.mjs";
@@ -17,6 +18,7 @@ import { runConcurrencyTests } from "./4-concurrency-race-conditions.mjs";
 import { runSecurityPenetrationTests } from "./5-security-penetration-owasp.mjs";
 import { runDatabaseIntegrityTests } from "./6-database-integrity-ledger.mjs";
 import { runChaosResilienceTests } from "./7-chaos-resilience-edge-cases.mjs";
+import { runWithdrawalPayoutTests } from "./8-withdrawal-payout.mjs";
 
 const suites = [
   { name: "Discipline 1: Unit & Pure Logic", fn: runUnitLogicTests },
@@ -26,6 +28,7 @@ const suites = [
   { name: "Discipline 5: Security & Penetration (OWASP API Top 10)", fn: runSecurityPenetrationTests },
   { name: "Discipline 6: Database Integrity & Ledger Invariant", fn: runDatabaseIntegrityTests },
   { name: "Discipline 7: Chaos, Resilience & Edge-Cases", fn: runChaosResilienceTests },
+  { name: "Discipline 8: Withdrawal & Payout Engine (Phase 8)", fn: runWithdrawalPayoutTests },
 ];
 
 async function main() {
